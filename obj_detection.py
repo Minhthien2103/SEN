@@ -1,0 +1,1 @@
+print('Object detection module loaded successfully')
