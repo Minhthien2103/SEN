@@ -7,16 +7,14 @@ import threading
 import wave
 import tempfile
 import numpy as np
-import math
-from collections import deque
-import torch
-from dotenv import load_dotenv
-import torchaudio.functional as F
-import noisereduce as nr
 import re
 from typing import Callable
-from STT_emotion_pred import EmotionPredictor
+from dotenv import load_dotenv
 from groq import Groq
+import torch
+import torchaudio.functional as F
+
+from STT_emotion_pred import EmotionPredictor
 
 load_dotenv()
 
@@ -37,12 +35,64 @@ except ImportError:
     raise SystemExit("❌ pip install rich")
 
 
+# ================= HELPERS =================
+
+def _resample_np(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
+
+    if orig_sr == target_sr:
+        return audio
+
+    t = torch.from_numpy(audio).unsqueeze(0)
+    t = F.resample(t, orig_sr, target_sr)
+    return t.squeeze(0).numpy()
+
+
+# ================= DEEPFILTERNET WRAPPER =================
+
+class DeepFilterDenoiser:
+    """
+    Wrapper cho DeepFilterNet — khử noise chất lượng cao.
+    pip install deepfilternet
+    """
+
+    DF_SR = 48000   # DeepFilterNet yêu cầu 48kHz
+
+    def __init__(self):
+
+        try:
+            from df.enhance import enhance, init_df
+        except ImportError:
+            raise SystemExit("❌ pip install deepfilternet")
+
+        self._enhance = enhance
+        self._model, self._df_state, _ = init_df()
+
+    def process(self, audio_f32: np.ndarray, sr: int) -> np.ndarray:
+        """
+        Nhận audio float32 @ sr bất kỳ.
+        Resample lên 48kHz → DeepFilterNet → resample về sr ban đầu.
+        """
+        audio_48k = _resample_np(audio_f32, sr, self.DF_SR)
+
+        tensor    = torch.from_numpy(audio_48k).unsqueeze(0)
+        enhanced  = self._enhance(self._model, self._df_state, tensor)
+        audio_48k = enhanced.squeeze(0).numpy()
+
+        return _resample_np(audio_48k, self.DF_SR, sr)
+
+
+# ================= SPEECH TO TEXT =================
+
 class SpeechToText:
 
-    def __init__(self, config: dict | None = None, on_transcript: Callable[[str], None] | None = None):
+    def __init__(
+        self,
+        config: dict | None = None,
+        on_transcript: Callable[[str], None] | None = None,
+    ):
 
         self.on_transcript = on_transcript
-        self.console = Console()
+        self.console       = Console()
 
         api_key = os.getenv("GROQ_API_KEY")
         if not api_key:
@@ -50,95 +100,39 @@ class SpeechToText:
         self.groq_client = Groq(api_key=api_key)
 
         self.config = config or {
-            "sample_rate": 16000,
-            "language": "vi",
+            "sample_rate":        16000,
+            "language":           "vi",
 
-            "vad_threshold": 0.45,
-            "min_speech_chunks": 2,
-            "min_silence_ms": 450,
-            "speech_pad_ms": 200,
-            "min_segment_ms": 400,
-
-            "webrtc_vad_mode": 0,
-
+            "vad_threshold":      0.45,
+            "min_silence_ms":     450,
             "early_transcribe_s": 8.0,
 
-            "save_to_file": True,
-            "output_file": "transcript.txt",
+            "webrtc_vad_mode":    1,
 
-            "save_audio": True,
-            "audio_output_dir": "recorded_audio",
+            "highpass_hz":        80,
+            "lowpass_hz":         7500,
 
-            # Audio clean (sẽ được override theo noise profile)
-            "highpass_hz": 80,
-            "lowpass_hz": 7500,
-            "nr_stationary": True,
-            "nr_prop_decrease": 0.6,
-            "nr_n_fft": 512,
+            "save_to_file":       True,
+            "output_file":        "transcript.txt",
+
+            "save_audio":         True,
+            "audio_output_dir":   "recorded_audio",
         }
 
-        # ================= NOISE PROFILES =================
-        # 3 mức: yên tĩnh / bình thường / ồn
-        self._env_profiles = {
-            "quiet": {
-                "webrtc_vad_mode": 0,
-                "vad_threshold": 0.40,
-                "min_silence_ms": 350,
-                "early_transcribe_s": 7.0,
-                "highpass_hz": 60,
-                "lowpass_hz": 7800,
-                "nr_stationary": True,
-                "nr_prop_decrease": 0.35,
-            },
-            "normal": {
-                "webrtc_vad_mode": 1,
-                "vad_threshold": 0.45,
-                "min_silence_ms": 450,
-                "early_transcribe_s": 8.0,
-                "highpass_hz": 80,
-                "lowpass_hz": 7500,
-                "nr_stationary": True,
-                "nr_prop_decrease": 0.60,
-            },
-            "noisy": {
-                "webrtc_vad_mode": 2,
-                "vad_threshold": 0.55,
-                "min_silence_ms": 650,
-                "early_transcribe_s": 9.0,
-                "highpass_hz": 120,
-                "lowpass_hz": 6800,
-                "nr_stationary": True,
-                "nr_prop_decrease": 0.80,
-            },
-        }
-
-        self._cfg_lock = threading.Lock()
-        self._env_level = "normal"
-
-        self.block_size = 512
+        self.block_size        = 512
         self._webrtc_frame_len = 320
 
-        self.audio_q = queue.Queue()
-        self.segment_q = queue.Queue()
-
+        self.audio_q    = queue.Queue()
+        self.segment_q  = queue.Queue()
         self.is_running = False
 
-        self.vad_model = None
+        self.vad_model  = None
         self.webrtc_vad = None
-
-        self._apply_env_profile(self._env_level, announce=False)
-
-        # Noise estimator state
-        self._noise_db_hist = deque(maxlen=200)
-        self._speech_db_hist = deque(maxlen=120)
-        self._last_env_eval_t = 0.0
-        self._env_eval_interval_s = 2.0
-        self._min_noise_blocks = 25
-        self._min_speech_blocks = 8
+        self.denoiser   = None
 
         self.collected_audio = []
-        self._seg_counter = 0
-        self._session_tag = time.strftime("%Y%m%d_%H%M%S")
+        self._seg_counter    = 0
+        self._session_tag    = time.strftime("%Y%m%d_%H%M%S")
 
         self.emotion_model = EmotionPredictor()
 
@@ -153,68 +147,6 @@ class SpeechToText:
             r"^-{2,}$",
         ]
 
-    # ================= NOISE EVAL =================
-
-    @staticmethod
-    def _rms_dbfs(samples_f32: np.ndarray) -> float:
-        """
-        Ước lượng RMS theo dBFS cho audio float32 [-1, 1].
-        """
-        x = np.asarray(samples_f32, dtype=np.float32)
-        if x.size == 0:
-            return -120.0
-        rms = float(np.sqrt(np.mean(x * x) + 1e-12))
-        return 20.0 * math.log10(rms + 1e-12)
-
-    @staticmethod
-    def _env_label_vi(level: str) -> str:
-        return {"quiet": "yên tĩnh", "normal": "bình thường", "noisy": "ồn"}.get(level, level)
-
-    def _apply_env_profile(self, level: str, announce: bool = True) -> None:
-        profile = self._env_profiles.get(level)
-        if not profile:
-            return
-
-        with self._cfg_lock:
-            for k, v in profile.items():
-                self.config[k] = v
-
-            # cập nhật WebRTC VAD mode ngay khi đổi profile
-            if self.webrtc_vad is not None:
-                try:
-                    self.webrtc_vad = webrtcvad.Vad(self.config["webrtc_vad_mode"])
-                except Exception:
-                    pass
-
-        if announce:
-            console.print(f"[magenta]🔊 Môi trường: {self._env_label_vi(level)}[/magenta]")
-
-    def _maybe_eval_environment(self) -> None:
-        now = time.time()
-        if now - self._last_env_eval_t < self._env_eval_interval_s:
-            return
-
-        self._last_env_eval_t = now
-
-        if len(self._noise_db_hist) < self._min_noise_blocks or len(self._speech_db_hist) < self._min_speech_blocks:
-            return
-
-        noise_db = float(np.median(np.array(self._noise_db_hist, dtype=np.float32)))
-        speech_db = float(np.median(np.array(self._speech_db_hist, dtype=np.float32)))
-        snr = speech_db - noise_db
-
-        # Heuristic thresholds (tinh chỉnh nếu cần)
-        if noise_db > -35.0 or snr < 10.0:
-            level = "noisy"
-        elif noise_db < -55.0 and snr > 20.0:
-            level = "quiet"
-        else:
-            level = "normal"
-
-        if level != self._env_level:
-            self._env_level = level
-            self._apply_env_profile(level, announce=True)
-
     # ================= MODEL LOAD =================
 
     def load_models(self):
@@ -228,11 +160,15 @@ class SpeechToText:
         self.vad_model.eval()
         console.print("[green]✅ Silero VAD OK[/green]")
 
+        console.print("[cyan]⏳ Tải DeepFilterNet...[/cyan]")
+        self.denoiser = DeepFilterDenoiser()
+        console.print("[green]✅ DeepFilterNet OK[/green]")
+
     # ================= SILERO CACHE =================
 
     def _load_silero_vad_local(self):
 
-        hub_dir = torch.hub.get_dir()
+        hub_dir    = torch.hub.get_dir()
         model_path = os.path.join(hub_dir, "silero_vad_cached.jit")
 
         if not os.path.exists(model_path):
@@ -243,16 +179,13 @@ class SpeechToText:
                 "snakers4/silero-vad",
                 "silero_vad",
                 force_reload=False,
-                onnx=False
+                onnx=False,
             )
 
             torch.jit.save(model, model_path)
             return model
 
-        else:
-
-            model = torch.jit.load(model_path, map_location="cpu")
-            return model
+        return torch.jit.load(model_path, map_location="cpu")
 
     # ================= AUDIO CALLBACK =================
 
@@ -261,19 +194,15 @@ class SpeechToText:
 
     # ================= WEBRTC VAD =================
 
-    def _webrtc_is_speech(self, samples_f32):
+    def _webrtc_is_speech(self, samples_f32: np.ndarray) -> bool:
 
         pcm_int16 = (samples_f32 * 32767).clip(-32768, 32767).astype(np.int16)
-
         frame_len = self._webrtc_frame_len
-        sr = self.config["sample_rate"]
-
-        n_frames = len(pcm_int16) // frame_len
+        sr        = self.config["sample_rate"]
+        n_frames  = len(pcm_int16) // frame_len
 
         for i in range(n_frames):
-
             frame = pcm_int16[i * frame_len:(i + 1) * frame_len].tobytes()
-
             try:
                 if self.webrtc_vad.is_speech(frame, sr):
                     return True
@@ -282,21 +211,24 @@ class SpeechToText:
 
         return False
 
+    def _vad_prob(self, block: np.ndarray) -> float:
+
+        t = torch.FloatTensor(block)
+        with torch.no_grad():
+            return self.vad_model(t, 16000).item()
+
     # ================= VAD THREAD =================
 
     def vad_thread(self):
 
-        SR = self.config["sample_rate"]
-
+        SR             = self.config["sample_rate"]
         min_sil_chunks = int(self.config["min_silence_ms"] / 1000 * SR / self.block_size)
-
-        early_chunks = int(self.config["early_transcribe_s"] * SR / self.block_size)
+        early_chunks   = int(self.config["early_transcribe_s"] * SR / self.block_size)
 
         speech_buf = []
-        sil_count = 0
-        in_speech = False
-
-        carry = np.array([], dtype=np.float32)
+        sil_count  = 0
+        in_speech  = False
+        carry      = np.array([], dtype=np.float32)
 
         self.vad_model.reset_states()
 
@@ -308,10 +240,8 @@ class SpeechToText:
                 continue
 
             combined = np.concatenate([carry, raw])
-
-            n = len(combined) // self.block_size
-
-            carry = combined[n * self.block_size:]
+            n        = len(combined) // self.block_size
+            carry    = combined[n * self.block_size:]
 
             for i in range(n):
 
@@ -320,29 +250,17 @@ class SpeechToText:
                 webrtc_speech = self._webrtc_is_speech(blk)
 
                 if not webrtc_speech and not in_speech:
-                    # block yên lặng/không nói: dùng để ước lượng noise floor
-                    self._noise_db_hist.append(self._rms_dbfs(blk))
-                    self._maybe_eval_environment()
                     continue
 
                 prob = self._vad_prob(blk)
-
-                # cập nhật speech stats khi có khả năng là giọng nói
-                if webrtc_speech:
-                    self._speech_db_hist.append(self._rms_dbfs(blk))
-                self._maybe_eval_environment()
-
-                with self._cfg_lock:
-                    vad_threshold = self.config["vad_threshold"]
-
-                is_v = prob >= vad_threshold
+                is_v = prob >= self.config["vad_threshold"]
 
                 if is_v:
 
                     sil_count = 0
 
                     if not in_speech:
-                        in_speech = True
+                        in_speech  = True
                         speech_buf = [blk]
                     else:
                         speech_buf.append(blk)
@@ -356,78 +274,58 @@ class SpeechToText:
 
                         if sil_count >= min_sil_chunks:
 
-                            audio = np.concatenate(speech_buf)
-
-                            self.segment_q.put(audio)
+                            self.segment_q.put(np.concatenate(speech_buf))
 
                             speech_buf = []
-                            sil_count = 0
-                            in_speech = False
+                            sil_count  = 0
+                            in_speech  = False
 
                             self.vad_model.reset_states()
 
-                if in_speech and len(speech_buf) >= early_chunks:
+            if in_speech and len(speech_buf) >= early_chunks:
 
-                    audio = np.concatenate(speech_buf)
+                self.segment_q.put(np.concatenate(speech_buf))
 
-                    self.segment_q.put(audio)
+                speech_buf = []
+                in_speech  = False
 
-                    speech_buf = []
-                    in_speech = False
-
-                    self.vad_model.reset_states()
-
-    def _vad_prob(self, block):
-
-        t = torch.FloatTensor(block)
-
-        with torch.no_grad():
-            return self.vad_model(t, 16000).item()
+                self.vad_model.reset_states()
 
     # ================= CLEAN AUDIO =================
 
-    def clean_audio(self, audio):
-
-        with self._cfg_lock:
-            sr = self.config["sample_rate"]
-            hp = self.config.get("highpass_hz", 80)
-            lp = self.config.get("lowpass_hz", 7500)
-            nr_stationary = self.config.get("nr_stationary", True)
-            nr_prop = self.config.get("nr_prop_decrease", 0.6)
-            nr_n_fft = self.config.get("nr_n_fft", 512)
+    def clean_audio(self, audio: np.ndarray) -> np.ndarray:
+        """
+        Pipeline:
+          1. Highpass / lowpass filter
+          2. DeepFilterNet denoise
+          3. Peak normalise
+        """
+        sr = self.config["sample_rate"]
+        hp = self.config.get("highpass_hz", 80)
+        lp = self.config.get("lowpass_hz", 7500)
 
         tensor = torch.from_numpy(audio).unsqueeze(0)
-
         tensor = F.highpass_biquad(tensor, sr, float(hp))
         tensor = F.lowpass_biquad(tensor, sr, float(lp))
+        audio  = tensor.squeeze(0).numpy()
 
-        audio = tensor.squeeze(0).numpy()
+        audio = self.denoiser.process(audio, sr)
 
         peak = np.max(np.abs(audio))
-
         if peak > 0:
             audio = audio / peak * 0.9
-
-        audio = nr.reduce_noise(
-            y=audio,
-            sr=sr,
-            stationary=bool(nr_stationary),
-            prop_decrease=float(nr_prop),
-            n_fft=int(nr_n_fft),
-        )
 
         return audio.astype(np.float32)
 
     # ================= GROQ STT =================
 
-    def groq_transcribe(self, audio):
+    def groq_transcribe(self, audio: np.ndarray) -> str:
 
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
 
             self._save_wav(f.name, audio)
 
             with open(f.name, "rb") as audio_file:
-
                 transcript = self.groq_client.audio.transcriptions.create(
                     file=audio_file,
                     model="whisper-large-v3-turbo",
@@ -438,7 +336,7 @@ class SpeechToText:
 
     # ================= HALLUCINATION FILTER =================
 
-    def _is_hallucination(self, text):
+    def _is_hallucination(self, text: str) -> bool:
 
         for pat in self.hallucination_patterns:
             if re.search(pat, text, re.IGNORECASE):
@@ -457,7 +355,7 @@ class SpeechToText:
             except queue.Empty:
                 continue
 
-            min_samples = int(self.config["sample_rate"] * self.config["min_segment_ms"] / 1000)
+            min_samples = int(self.config["sample_rate"] * 0.4)
 
             if len(audio) < min_samples:
                 continue
@@ -465,6 +363,12 @@ class SpeechToText:
             clean = self.clean_audio(audio)
 
             self.collected_audio.append(clean)
+
+            if self.config.get("save_audio", False):
+                try:
+                    self._save_segment_wav(clean)
+                except Exception as e:
+                    console.print(f"[red]Audio save error: {e}[/red]")
 
             start = time.time()
 
@@ -493,17 +397,15 @@ class SpeechToText:
             )
 
             if self.config["save_to_file"]:
-
                 with open(self.config["output_file"], "a", encoding="utf-8") as f:
                     f.write(f"[VI] {text}\n")
 
-            emotion = self.emotion_model.predict(text)
-
-            # In cảm xúc trội + xác suất của tất cả cảm xúc
+            emotion   = self.emotion_model.predict(text)
             probs_str = ", ".join(
                 f"{label}: {emotion.get(label, 0.0):.3f}"
                 for label in getattr(self.emotion_model, "labels", [])
             )
+
             if probs_str:
                 console.print(
                     f"[cyan]🧠 Emotion:[/cyan] {emotion['dominant']} "
@@ -512,11 +414,7 @@ class SpeechToText:
             else:
                 console.print(f"[cyan]🧠 Emotion:[/cyan] {emotion['dominant']}")
 
-            # In mức môi trường hiện tại để bạn theo dõi
-            console.print(f"[dim]🔊 Env: {self._env_label_vi(self._env_level)}[/dim]")
-
             if self.on_transcript:
-
                 try:
                     self.on_transcript(text)
                 except Exception as e:
@@ -530,7 +428,7 @@ class SpeechToText:
 
         self.is_running = True
 
-        threading.Thread(target=self.vad_thread, daemon=True).start()
+        threading.Thread(target=self.vad_thread,        daemon=True).start()
         threading.Thread(target=self.transcribe_thread, daemon=True).start()
 
         console.print("\n[green]🎙️ Đang lắng nghe...[/green]\n")
@@ -552,31 +450,47 @@ class SpeechToText:
         except KeyboardInterrupt:
 
             console.print("\n[red]⏹️ Đã dừng[/red]")
-
             self.is_running = False
+
+            try:
+                self._save_full_session()
+            except Exception as e:
+                console.print(f"[red]Full session save error: {e}[/red]")
 
     # ================= SAVE WAV =================
 
-    def _save_wav(self, path, audio):
+    def _save_wav(self, path: str, audio: np.ndarray):
 
-        sr = self.config["sample_rate"]
-
+        sr  = self.config["sample_rate"]
         pcm = (audio * 32767).clip(-32768, 32767).astype(np.int16)
 
         with wave.open(path, "wb") as wf:
-
             wf.setnchannels(1)
             wf.setsampwidth(2)
             wf.setframerate(sr)
             wf.writeframes(pcm.tobytes())
 
+    def _save_segment_wav(self, audio: np.ndarray) -> str:
+
+        out_dir = self.config.get("audio_output_dir", "recorded_audio")
+        os.makedirs(out_dir, exist_ok=True)
+
+        self._seg_counter += 1
+        seg_path = os.path.join(out_dir, f"{self._session_tag}_seg{self._seg_counter:03d}.wav")
+        self._save_wav(seg_path, audio)
+
+        return seg_path
+
     def _save_full_session(self):
-        """Ghép tất cả đoạn đã nhận diện thành một file WAV duy nhất."""
+
         if not self.config["save_audio"] or not self.collected_audio:
             return
+
         out_dir   = self.config["audio_output_dir"]
         os.makedirs(out_dir, exist_ok=True)
+
         full_path = os.path.join(out_dir, f"{self._session_tag}_full_session.wav")
         combined  = np.concatenate(self.collected_audio)
+
         self._save_wav(full_path, combined)
         console.print(f"[bold green]✅ Đã lưu toàn bộ phiên: {full_path}[/bold green]")
