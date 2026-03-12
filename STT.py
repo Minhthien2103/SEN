@@ -15,6 +15,8 @@ import torch
 import torchaudio.functional as F
 
 from STT_emotion_pred import EmotionPredictor
+from Env_classifier import EnvironmentClassifier
+from SER import AudioToneAnalyzer
 
 load_dotenv()
 
@@ -104,7 +106,8 @@ class SpeechToText:
             "language":           "vi",
 
             "vad_threshold":      0.45,
-            "min_silence_ms":     450,
+            "min_silence_ms":     600,
+            "min_speech_ms":      250,  # Thời lượng giọng nói tối thiểu phải có trong 1 đoạn
             "early_transcribe_s": 8.0,
 
             "webrtc_vad_mode":    1,
@@ -135,6 +138,9 @@ class SpeechToText:
         self._session_tag    = time.strftime("%Y%m%d_%H%M%S")
 
         self.emotion_model = EmotionPredictor()
+        self.tone_model    = AudioToneAnalyzer(debug=True)
+
+        self.env_classifier = EnvironmentClassifier(on_env_change=self._on_env_change)
 
         self.hallucination_patterns = [
             r"^\s*$",
@@ -163,6 +169,8 @@ class SpeechToText:
         console.print("[cyan]⏳ Tải DeepFilterNet...[/cyan]")
         self.denoiser = DeepFilterDenoiser()
         console.print("[green]✅ DeepFilterNet OK[/green]")
+
+        self.env_classifier.start()
 
     # ================= SILERO CACHE =================
 
@@ -197,17 +205,19 @@ class SpeechToText:
     def _webrtc_is_speech(self, samples_f32: np.ndarray) -> bool:
 
         pcm_int16 = (samples_f32 * 32767).clip(-32768, 32767).astype(np.int16)
-        frame_len = self._webrtc_frame_len
         sr        = self.config["sample_rate"]
-        n_frames  = len(pcm_int16) // frame_len
+        
+        # Lấy 30ms (480 samples ở 16kHz) từ cuối khối 512 samples để WebRTC hoạt động chính xác
+        if len(pcm_int16) >= 480:
+            frame = pcm_int16[-480:].tobytes()
+        else:
+            return False
 
-        for i in range(n_frames):
-            frame = pcm_int16[i * frame_len:(i + 1) * frame_len].tobytes()
-            try:
-                if self.webrtc_vad.is_speech(frame, sr):
-                    return True
-            except Exception:
+        try:
+            if self.webrtc_vad.is_speech(frame, sr):
                 return True
+        except Exception:
+            return True
 
         return False
 
@@ -221,14 +231,20 @@ class SpeechToText:
 
     def vad_thread(self):
 
-        SR             = self.config["sample_rate"]
-        min_sil_chunks = int(self.config["min_silence_ms"] / 1000 * SR / self.block_size)
-        early_chunks   = int(self.config["early_transcribe_s"] * SR / self.block_size)
+        SR                = self.config["sample_rate"]
+        min_sil_chunks    = int(self.config["min_silence_ms"] / 1000 * SR / self.block_size)
+        early_chunks      = int(self.config["early_transcribe_s"] * SR / self.block_size)
+        min_speech_blocks = int(self.config.get("min_speech_ms", 250) / 1000 * SR / self.block_size)
 
-        speech_buf = []
-        sil_count  = 0
-        in_speech  = False
-        carry      = np.array([], dtype=np.float32)
+        speech_buf          = []
+        sil_count           = 0
+        speech_blocks_count = 0
+        in_speech           = False
+        carry               = np.array([], dtype=np.float32)
+
+        from collections import deque
+        # Giữ lại 300ms pre-speech audio để không bị mất âm đầu của từ
+        pre_speech_pad = deque(maxlen=int(0.3 * SR / self.block_size))
 
         self.vad_model.reset_states()
 
@@ -250,6 +266,8 @@ class SpeechToText:
                 webrtc_speech = self._webrtc_is_speech(blk)
 
                 if not webrtc_speech and not in_speech:
+                    self.env_classifier.push_audio(blk)
+                    pre_speech_pad.append(blk)
                     continue
 
                 prob = self._vad_prob(blk)
@@ -261,35 +279,38 @@ class SpeechToText:
 
                     if not in_speech:
                         in_speech  = True
-                        speech_buf = [blk]
+                        speech_buf = list(pre_speech_pad) + [blk]
+                        speech_blocks_count = len(speech_buf)
                     else:
                         speech_buf.append(blk)
+                        speech_blocks_count += 1
 
                 else:
+                    if not in_speech:
+                        pre_speech_pad.append(blk)
 
                     if in_speech:
 
                         speech_buf.append(blk)
                         sil_count += 1
 
-                        if sil_count >= min_sil_chunks:
+                        # Tránh cắt ngang từ bằng cách kết hợp early cut với 1 khoảng lặng nhỏ
+                        # Hoặc force cut nếu nói liên tục quá dài
+                        is_early_cut = (len(speech_buf) >= early_chunks and sil_count >= (min_sil_chunks // 3))
+                        is_force_cut = len(speech_buf) >= int(early_chunks * 1.5)
 
-                            self.segment_q.put(np.concatenate(speech_buf))
+                        if sil_count >= min_sil_chunks or is_early_cut or is_force_cut:
 
-                            speech_buf = []
-                            sil_count  = 0
-                            in_speech  = False
+                            if speech_blocks_count >= min_speech_blocks:
+                                self.segment_q.put(np.concatenate(speech_buf))
+
+                            speech_buf          = []
+                            sil_count           = 0
+                            speech_blocks_count = 0
+                            in_speech           = False
+                            pre_speech_pad.clear()
 
                             self.vad_model.reset_states()
-
-            if in_speech and len(speech_buf) >= early_chunks:
-
-                self.segment_q.put(np.concatenate(speech_buf))
-
-                speech_buf = []
-                in_speech  = False
-
-                self.vad_model.reset_states()
 
     # ================= CLEAN AUDIO =================
 
@@ -330,9 +351,17 @@ class SpeechToText:
                     file=audio_file,
                     model="whisper-large-v3-turbo",
                     language="vi",
+                    temperature=0.0,
+                    prompt="Tiếng Việt, ghi âm rõ ràng."
                 )
 
         return transcript.text
+
+    # ================= Env_Callback =================
+    def _on_env_change(self, preset: str, label: str) -> None:
+        for k, v in EnvironmentClassifier.PRESETS[preset].items():
+            self.config[k] = v
+        console.print(f"[magenta]🔊 Môi trường: {preset} ({label})[/magenta]")
 
     # ================= HALLUCINATION FILTER =================
 
@@ -406,13 +435,23 @@ class SpeechToText:
                 for label in getattr(self.emotion_model, "labels", [])
             )
 
+            tone = self.tone_model.analyze(audio, self.config["sample_rate"])
+
+            # In kết quả Emotion từ Text
             if probs_str:
                 console.print(
-                    f"[cyan]🧠 Emotion:[/cyan] {emotion['dominant']} "
+                    f"[cyan]📝 Text Emotion:[/cyan] {emotion['dominant']} "
                     f"[dim]({probs_str})[/dim]"
                 )
             else:
-                console.print(f"[cyan]🧠 Emotion:[/cyan] {emotion['dominant']}")
+                console.print(f"[cyan]📝 Text Emotion:[/cyan] {emotion['dominant']}")
+                
+            # In kết quả Điệu bộ từ Audio Tone
+            tone_probs_str = ", ".join(f"{k}: {v:.3f}" for k,v in tone.items() if k not in ["dominant", "human_readable"])
+            console.print(
+                f"[magenta]🎙️ Audio Tone:[/magenta] {tone['human_readable']} "
+                f"[dim]({tone_probs_str})[/dim]"
+            )
 
             if self.on_transcript:
                 try:
