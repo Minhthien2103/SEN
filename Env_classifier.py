@@ -1,15 +1,33 @@
-import os
-os.environ["PANNS_HOME"] = r"C:\Users\PC\panns_data"  # phải set TRƯỚC khi import
+"""
+EnvironmentClassifier — CLAP zero-shot audio classification
+Model: laion/clap-htsat-fused (HuggingFace Transformers + PyTorch)
 
+Cài đặt:
+    pip install transformers accelerate
 
-import numpy as np
+Không cần TensorFlow. Tương thích hoàn toàn với stack PyTorch hiện tại.
+
+Ưu điểm so với PANNS/signal-based:
+    - Zero-shot: thay đổi labels bằng ngôn ngữ tự nhiên, không cần LABEL_MAP
+    - CLAP yêu cầu 48kHz — tự resample từ 16kHz trong code
+    - Chạy background thread, không ảnh hưởng latency STT/TTS
+"""
+
 import threading
 import time
 
+import numpy as np
+import torch
+
 try:
-    from panns_inference import AudioTagging
+    from transformers import pipeline
 except ImportError:
-    raise SystemExit("❌ pip install panns-inference")
+    raise SystemExit("❌ pip install transformers accelerate")
+
+try:
+    import torchaudio.functional as F_audio
+except ImportError:
+    raise SystemExit("❌ pip install torchaudio")
 
 try:
     from rich.console import Console
@@ -22,201 +40,178 @@ except ImportError:
 
 class EnvironmentClassifier:
     """
-    Nhận diện môi trường xung quanh bằng PANNS (AudioSet 527 classes, PyTorch).
-    Chạy nền mỗi eval_interval_s giây trên audio im lặng (WebRTC = False).
-    Tự động gọi callback on_env_change khi phát hiện môi trường thay đổi.
+    Nhận diện môi trường bằng CLAP zero-shot audio classification.
+    Chạy nền mỗi eval_interval_s giây trên audio im lặng (mic không muted).
+    Chỉ in ra màn hình khi môi trường thay đổi.
     """
-
-    # ================= LABEL MAP =================
-    # Map PANNS label → preset (quiet / normal / noisy)
-    # Chỉnh sửa nếu môi trường thực tế của bạn trả về label khác
-
-    LABEL_MAP = {
-        # Quiet
-        "Silence":                  "quiet",
-        "Inside, small room":       "quiet",
-        "Hum":                      "quiet",
-        "White noise":              "quiet",
-        "Pink noise":               "quiet",
-
-        # Normal
-        "Office":                   "normal",
-        "Typing":                   "normal",
-        "Computer keyboard":        "normal",
-        "Printer":                  "normal",
-        "Speech":                   "normal",
-        "Conversation":             "normal",
-        "Female speech, woman speaking": "normal",
-        "Male speech, man speaking":     "normal",
-        "Inside, large room or hall":    "normal",
-
-        # Noisy
-        "Noise":                    "noisy",
-        "Background noise":         "noisy",
-        "Babbling":                 "noisy",
-        "Crowd":                    "noisy",
-        "Hubbub, speech noise, speech babble": "noisy",
-        "Restaurant":               "noisy",
-        "Music":                    "noisy",
-        "Traffic noise, roadway noise": "noisy",
-        "Car":                      "noisy",
-        "Vehicle":                  "noisy",
-        "Horn":                     "noisy",
-        "Wind":                     "noisy",
-        "Rain":                     "noisy",
-        "Thunder":                  "noisy",
-        "Construction":             "noisy",
-        "Drill":                    "noisy",
-        "Chatter":                  "noisy",
-    }
 
     # ================= PRESETS =================
 
     PRESETS = {
         "quiet": {
-            "vad_threshold":      0.40,
-            "min_silence_ms":     350,
-            "webrtc_vad_mode":    0,
-            "highpass_hz":        60,
-            "lowpass_hz":         7800,
+            "vad_threshold":   0.40,
+            "min_silence_ms":  350,
+            "webrtc_vad_mode": 0,
+            "highpass_hz":     60,
+            "lowpass_hz":      7800,
         },
         "normal": {
-            "vad_threshold":      0.45,
-            "min_silence_ms":     450,
-            "webrtc_vad_mode":    1,
-            "highpass_hz":        80,
-            "lowpass_hz":         7500,
+            "vad_threshold":   0.55,
+            "min_silence_ms":  450,
+            "webrtc_vad_mode": 2,
+            "highpass_hz":     80,
+            "lowpass_hz":      7500,
         },
         "noisy": {
-            "vad_threshold":      0.60,
-            "min_silence_ms":     650,
-            "webrtc_vad_mode":    3,
-            "highpass_hz":        120,
-            "lowpass_hz":         6800,
+            "vad_threshold":   0.65,
+            "min_silence_ms":  650,
+            "webrtc_vad_mode": 3,
+            "highpass_hz":     120,
+            "lowpass_hz":      6800,
         },
     }
 
-    # Cần ít nhất N giây audio để classify đáng tin cậy
-    _MIN_AUDIO_S   = 2.0
-    _SAMPLE_RATE   = 16000
-    _MIN_SAMPLES   = int(_MIN_AUDIO_S * _SAMPLE_RATE)
+    # ================= CANDIDATE LABELS =================
+    # Mô tả bằng tiếng Anh tự nhiên — CLAP hiểu ngữ nghĩa, không cần map thủ công.
+    # Thay đổi thoải mái mà không cần sửa code logic.
 
-    # Giữ lịch sử N lần classify gần nhất để vote (tránh flip liên tục)
-    _VOTE_WINDOW   = 3
+    CANDIDATE_LABELS = {
+        "quiet":  "a very quiet room with almost no background noise or silence",
+        "normal": "a quiet indoor environment with light ambient sounds like typing or air conditioning",
+        "noisy":  "a noisy environment with crowd noise, traffic, music, or loud background sounds",
+    }
+
+    # CLAP yêu cầu 48kHz — STT đang dùng 16kHz, cần resample
+    _STT_SR   = 16_000
+    _CLAP_SR  = 48_000
+
+    # Cần tối thiểu N giây để classify đáng tin cậy
+    _MIN_AUDIO_S = 2.0
+    _MIN_SAMPLES = int(_MIN_AUDIO_S * _STT_SR)
+
+    # Vote window — tránh flip liên tục
+    _VOTE_WINDOW = 3
 
     def __init__(
         self,
         on_env_change,
-        eval_interval_s: float = 5.0,
-        device: str = "cuda",
+        eval_interval_s: float = 3.0,
+        model_id: str = "laion/clap-htsat-fused",
+        device: str | None = None,
     ):
-        """
-        on_env_change : callback(preset: str, label: str) — gọi khi môi trường đổi
-        eval_interval_s : bao lâu classify 1 lần (giây)
-        device          : "cpu" hoặc "cuda"
-        """
         self.on_env_change   = on_env_change
         self.eval_interval_s = eval_interval_s
 
-        self._audio_buf  = []
-        self._buf_lock   = threading.Lock()
-        self._current    = "normal"
-        self._history    = []           # lịch sử preset để vote
-        self._running    = False
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        console.print("[cyan]⏳ Tải PANNS AudioTagging...[/cyan]")
-        self._model      = AudioTagging(checkpoint_path=None, device=device)
-        self._labels     = self._load_labels()
-        console.print("[green]✅ PANNS OK[/green]")
+        self._audio_buf = []
+        self._buf_lock  = threading.Lock()
+        self._current   = "normal"
+        self._history   = []
+        self._running   = False
 
-    # ================= LABEL LOADER =================
+        console.print(f"[cyan]⏳ Tải CLAP model ({model_id}, device={device})...[/cyan]")
 
-    @staticmethod
-    def _load_labels() -> list[str]:
-        """
-        Tải class names AudioSet 527 từ file CSV của PANNS.
-        Tự download nếu chưa có.
-        """
-        import os
-        import csv
-        import urllib.request
+        try:
+            self._pipe = pipeline(
+                task="zero-shot-audio-classification",
+                model=model_id,
+                device=0 if device == "cuda" else -1,
+            )
+        except Exception as e:
+            if device == "cuda":
+                console.print(f"[yellow]⚠️  CUDA load thất bại ({e}), fallback CPU...[/yellow]")
+                self._pipe = pipeline(
+                    task="zero-shot-audio-classification",
+                    model=model_id,
+                    device=-1,
+                )
+            else:
+                raise
 
-        path = "audioset_class_labels.csv"
-        url  = (
-            "https://raw.githubusercontent.com/qiuqiangkong/"
-            "audioset_tagging_cnn/master/metadata/class_labels_indices.csv"
-        )
+        # Pre-compute text embeddings một lần duy nhất lúc khởi động
+        # để classify sau này chỉ cần chạy audio encoder → nhanh hơn
+        self._labels     = list(self.CANDIDATE_LABELS.keys())
+        self._label_text = list(self.CANDIDATE_LABELS.values())
 
-        if not os.path.exists(path):
-            console.print("[yellow]📥 Downloading AudioSet class labels...[/yellow]")
-            urllib.request.urlretrieve(url, path)
-
-        with open(path, newline="", encoding="utf-8") as f:
-            return [row["display_name"] for row in csv.DictReader(f)]
+        console.print("[green]✅ CLAP sẵn sàng[/green]")
 
     # ================= AUDIO BUFFER =================
 
     def push_audio(self, block: np.ndarray) -> None:
         """
-        Nhận block audio im lặng từ VAD thread (WebRTC = False).
-        Chỉ gọi khi không có giọng nói để tránh classify nhầm giọng thành noise.
+        Nhận block audio float32 @ 16kHz từ audio_callback.
+        Chỉ được gọi khi mic KHÔNG bị mute (SEN không đang nói).
         """
         with self._buf_lock:
             self._audio_buf.append(block.copy())
 
+    # ================= RESAMPLE =================
+
+    @staticmethod
+    def _resample(audio: np.ndarray) -> np.ndarray:
+        """16kHz mono float32 → 48kHz mono float32 (CLAP yêu cầu)."""
+        t = torch.from_numpy(audio).unsqueeze(0)
+        t = F_audio.resample(t, EnvironmentClassifier._STT_SR, EnvironmentClassifier._CLAP_SR)
+        return t.squeeze(0).numpy()
+
     # ================= CLASSIFY =================
 
     def _classify_once(self) -> tuple[str, str]:
-
+        """
+        Chạy CLAP zero-shot trên buffer audio hiện tại.
+        Trả về (preset, label_text_thắng).
+        """
         with self._buf_lock:
             if not self._audio_buf:
                 return self._current, "N/A"
-
             audio = np.concatenate(self._audio_buf)
             self._audio_buf.clear()
 
         if len(audio) < self._MIN_SAMPLES:
             return self._current, "N/A"
 
-        inp = audio[np.newaxis, :].astype(np.float32)
+        # Resample lên 48kHz cho CLAP
+        audio_48k = self._resample(audio)
 
-        _, clipwise = self._model.inference(inp)
-        scores      = clipwise[0]
+        try:
+            results = self._pipe(
+                audio_48k,
+                candidate_labels=self._label_text,
+                sampling_rate=self._CLAP_SR,
+            )
+        except Exception as e:
+            console.print(f"[red]❌ CLAP inference lỗi: {e}[/red]")
+            return self._current, "N/A"
 
-        # Giới hạn index không vượt quá số labels thực tế
-        n_classes   = min(len(scores), len(self._labels))
-        scores      = scores[:n_classes]
+        # results = [{"score": 0.9, "label": "a very quiet room..."}, ...]
+        # Map label text → preset key
+        top_text  = results[0]["label"]
+        top_score = results[0]["score"]
 
-        top_indices = np.argsort(scores)[-10:][::-1]
-        top_labels  = [(self._labels[i], float(scores[i])) for i in top_indices]
+        # Tìm preset key tương ứng với label text thắng
+        winner = self._current
+        for preset, text in self.CANDIDATE_LABELS.items():
+            if text == top_text:
+                winner = preset
+                break
 
-        for label, score in top_labels:
-            if label in self.LABEL_MAP:
-                return self.LABEL_MAP[label], label
-
-        return self._current, top_labels[0][0]
+        return winner, f"{top_text[:40]}... ({top_score:.2f})"
 
     def _vote(self, new_preset: str) -> str:
-        """
-        Giữ lịch sử _VOTE_WINDOW lần gần nhất.
-        Trả về preset thắng đa số — tránh flip liên tục.
-        """
         self._history.append(new_preset)
-
         if len(self._history) > self._VOTE_WINDOW:
             self._history.pop(0)
-
         return max(set(self._history), key=self._history.count)
 
     # ================= BACKGROUND LOOP =================
 
     def _loop(self) -> None:
-
         while self._running:
-
             time.sleep(self.eval_interval_s)
 
-            raw_preset, top_label = self._classify_once()
+            raw_preset, reason = self._classify_once()
 
             if raw_preset == "N/A":
                 continue
@@ -224,14 +219,19 @@ class EnvironmentClassifier:
             voted_preset = self._vote(raw_preset)
 
             if voted_preset != self._current:
+                old = self._current
                 self._current = voted_preset
-                self.on_env_change(voted_preset, top_label)
+                console.print(
+                    f"[magenta]🌍 Môi trường: {old} → {voted_preset}[/magenta]"
+                )
+                self.on_env_change(voted_preset, reason)
 
     # ================= PUBLIC =================
 
     def start(self) -> None:
         self._running = True
-        threading.Thread(target=self._loop, daemon=True).start()
+        threading.Thread(target=self._loop, daemon=True, name="EnvClassifier").start()
+        console.print("[green]✅ EnvironmentClassifier (CLAP) đang chạy nền[/green]")
 
     def stop(self) -> None:
         self._running = False

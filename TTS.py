@@ -60,6 +60,9 @@ class TextToSpeech:
         self.volume = volume
         self.pitch  = pitch
 
+        # Tham chiếu tới STT để điều khiển mic gate
+        self._stt = None  # set sau bằng tts.set_stt(stt_instance)
+
         self._q:        queue.Queue[str | None] = queue.Queue()
         self._audio_q:  queue.Queue[bytes | None] = queue.Queue()
         self._is_speaking = threading.Event()
@@ -74,6 +77,10 @@ class TextToSpeech:
         self._worker_play.start()
 
         console.print(f"[green]✅ TTS sẵn sàng — giọng: [bold]{voice}[/bold][/green]")
+
+    def set_stt(self, stt) -> None:
+        """Liên kết STT instance để TTS có thể điều khiển mic gate."""
+        self._stt = stt
 
     @staticmethod
     def _clean_text(text: str) -> str:
@@ -149,6 +156,9 @@ class TextToSpeech:
             if text is None:
                 self._audio_q.put(None)
                 break
+            # Tắt mic ngay khi bắt đầu tổng hợp âm thanh
+            if self._stt:
+                self._stt.mute_mic()
             try:
                 audio = asyncio.run(
                     _synthesize(text, self.voice, self.rate, self.volume, self.pitch)
@@ -169,3 +179,6 @@ class TextToSpeech:
                 console.print(f"[red]TTS play error: {e}[/red]")
             finally:
                 self._is_speaking.clear()
+                # Bật lại mic chỉ khi queue âm thanh đã trống (SEN nói xong hẳn)
+                if self._audio_q.empty() and self._stt:
+                    self._stt.unmute_mic()

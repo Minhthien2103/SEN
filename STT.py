@@ -108,12 +108,12 @@ class SpeechToText:
             "sample_rate":        16000,
             "language":           "vi",
 
-            "vad_threshold":      0.45,
-            "min_silence_ms":     600,
+            "vad_threshold":      0.50,
+            "min_silence_ms":     650,
             "min_speech_ms":      250,  # Thời lượng giọng nói tối thiểu phải có trong 1 đoạn
             "early_transcribe_s": 8.0,
 
-            "webrtc_vad_mode":    1,
+            "webrtc_vad_mode":    2,
 
             "highpass_hz":        80,
             "lowpass_hz":         7500,
@@ -131,6 +131,9 @@ class SpeechToText:
         self.audio_q    = queue.Queue()
         self.segment_q  = queue.Queue()
         self.is_running = False
+
+        # ── Mic gate: khi set → audio_callback bỏ qua mọi input ──
+        self._mic_muted = threading.Event()
 
         self.vad_model  = None
         self.webrtc_vad = None
@@ -158,6 +161,22 @@ class SpeechToText:
             r"^\.{2,}$",
             r"^-{2,}$",
         ]
+
+    # ================= MIC GATE =================
+
+    def mute_mic(self) -> None:
+        """Tắt mic — audio_callback sẽ bỏ qua tất cả input."""
+        self._mic_muted.set()
+
+    def unmute_mic(self) -> None:
+        """Bật lại mic để thu âm."""
+        # Xả sạch queue cũ (âm thanh thu trong lúc mic 'tắt') trước khi mở lại
+        while not self.audio_q.empty():
+            try:
+                self.audio_q.get_nowait()
+            except queue.Empty:
+                break
+        self._mic_muted.clear()
 
     # ================= MODEL LOAD =================
 
@@ -204,7 +223,20 @@ class SpeechToText:
     # ================= AUDIO CALLBACK =================
 
     def audio_callback(self, indata, frames, time_info, status):
-        self.audio_q.put(indata[:, 0].copy().astype(np.float32))
+        block = indata[:, 0].copy().astype(np.float32)
+
+        # Env classifier luôn nhận audio bất kể mic gate.
+        # Chỉ feed khi mic KHÔNG muted: lúc đó audio là môi trường thật
+        # (người dùng im lặng / đang nói). Khi mic muted = SEN đang nói qua loa
+        # → không feed để tránh classify nhầm giọng TTS thành "noise".
+        if not self._mic_muted.is_set() and hasattr(self, "env_classifier"):
+            self.env_classifier.push_audio(block)
+
+        # Bỏ qua VAD pipeline khi mic đang bị tắt (SEN đang nói)
+        if self._mic_muted.is_set():
+            return
+
+        self.audio_q.put(block)
 
     # ================= WEBRTC VAD =================
 
@@ -275,7 +307,6 @@ class SpeechToText:
                 webrtc_speech = self._webrtc_is_speech(blk)
 
                 if not webrtc_speech and not in_speech:
-                    self.env_classifier.push_audio(blk)
                     pre_speech_pad.append(blk)
                     continue
 
@@ -350,7 +381,7 @@ class SpeechToText:
         # 3. TRỘN ÂM THANH (Blend)
         # 0.7 nghĩa là 70% âm thanh đã khử nhiễu + 30% âm thanh gốc
         # Bạn có thể tăng giảm con số này (ví dụ: 0.5, 0.8) để tìm ra mức tốt nhất
-        blend_ratio = 0.8 
+        blend_ratio = 0.75 
         mixed_audio = (clean_audio * blend_ratio) + (original_audio * (1.0 - blend_ratio))
 
         # 4. Chuẩn hóa âm lượng (Normalize)

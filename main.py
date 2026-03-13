@@ -33,6 +33,9 @@ def on_new_transcript(text: str) -> None:
 
 # STT + callback: khi nói xong → lưu transcript → gọi Gemini → TTS đọc
 stt = SpeechToText(on_transcript=on_new_transcript, tts=tts)
+
+# Liên kết hai chiều: TTS cần biết STT để điều khiển mic gate
+tts.set_stt(stt)
 try:
     stt.run()
 finally:
