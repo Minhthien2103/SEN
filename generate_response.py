@@ -58,7 +58,7 @@ class ConversationMemory:
     Lưu lịch sử hội thoại (sliding window)
     """
 
-    def __init__(self, max_turns: int = 6):
+    def __init__(self, max_turns: int = 2):
         self.history = deque(maxlen=max_turns)
 
     def add_user(self, text: str):

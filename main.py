@@ -1,3 +1,4 @@
+import sys
 from STT import SpeechToText
 from generate_response import ResponseGenerator
 from TTS import TextToSpeech
@@ -8,30 +9,24 @@ generator = ResponseGenerator()
 tts = TextToSpeech()
 
 
-import sys
-
 def on_new_transcript(text: str) -> None:
-    """Mỗi khi STT có câu mới: gọi Gemini streaming → in chữ nào ra chữ đó → đọc to qua TTS từng câu."""
-    console.print(f"\n[bold green][SEN][/bold green] ", end="")
+    # In prefix [SEN] màu vàng giống [VI]
+    console.print("[bold yellow][SEN][/bold yellow] ", end="")
     
-    current_sentence = ""
+    # Bắt đầu nhận luồng stream từ AI
     for token in generator.reply_stream(text):
-        # In trực tiếp token ra màn hình ngay lập tức mà không phá tag rich
+        # 1. In ra terminal ngay lập tức để mắt nhìn thấy
         sys.stdout.write(token)
         sys.stdout.flush()
         
-        current_sentence += token
+        # 2. Đẩy thẳng token vào bộ đệm của TTS
+        # Hàm này sẽ tự động lo việc kiểm tra dấu câu (phẩy, chấm, hỏi...) 
+        # và gọi tts.speak() ngay khi cắt được 1 cụm có nghĩa.
+        tts.stream_token(token)
         
-        # Ngắt câu nếu kết thúc bằng dấu câu cộng với khoảng trắng hoặc xuống dòng
-        if any(current_sentence.endswith(p) for p in ['. ', '! ', '? ', '.\n', '!\n', '?\n', '\n']):
-            sentence_to_speak = current_sentence.strip()
-            if sentence_to_speak:
-                tts.speak(sentence_to_speak)
-            current_sentence = ""
-            
-    # Đọc phần còn lại nếu có
-    if current_sentence.strip():
-        tts.speak(current_sentence.strip())
+    # 3. Khi AI đã sinh xong toàn bộ text, gọi flush để phát nốt 
+    # những chữ cái cuối cùng còn sót lại trong bộ đệm (không có dấu câu kết thúc)
+    tts.flush_stream()
     
     print() # Xuống dòng khi kết thúc output của SEN
 
