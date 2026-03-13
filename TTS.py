@@ -1,12 +1,19 @@
-import asyncio
-import io
+import os
 import queue
 import threading
 import re
+import base64
 
-import edge_tts
 import sounddevice as sd
-import soundfile as sf
+import numpy as np
+
+from dotenv import load_dotenv
+load_dotenv()
+
+try:
+    import requests
+except ImportError:
+    raise SystemExit("❌ pip install requests")
 
 try:
     from rich.console import Console
@@ -14,149 +21,236 @@ try:
 except ImportError:
     raise SystemExit("❌ pip install rich")
 
-
 # ===================== CONFIG =====================
 
-#DEFAULT_VOICE   = "vi-VN-NamMinhNeural"   # Giọng nam   tiếng Việt
-DEFAULT_VOICE = "vi-VN-HoaiMyNeural"   # Giọng nữ   tiếng Việt
-DEFAULT_RATE    = "+30%"    # tốc độ: -50% .. +100%
-DEFAULT_VOLUME  = "+0%"    # âm lượng: -50% .. +50%
-DEFAULT_PITCH   = "+0Hz"   # cao độ:   -50Hz .. +50Hz
+GEMINI_API_KEY_ENV = "GEMINI_API_KEY"
+GEMINI_VOICE_NAME_ENV = "GEMINI_VOICE_NAME"
+
+# Dùng model hỗ trợ Audio output (gemini-2.0-flash hoặc gemini-1.5-flash)
+DEFAULT_MODEL_ID = "gemini-2.5-flash-preview-tts"
+# Gemini thường trả về PCM ở mức 24000Hz
+DEFAULT_SAMPLE_RATE = 24000
+# Các giọng đọc: Puck, Charon, Kore, Fenrir, Aoede
+DEFAULT_VOICE_NAME = "Puck"
 
 
-# ===================== HELPER =====================
+# ===================== AUDIO =====================
 
-async def _synthesize(text: str, voice: str, rate: str, volume: str, pitch: str) -> bytes:
-    """Gọi Edge TTS và trả về raw audio bytes (MP3)."""
-    communicate = edge_tts.Communicate(
-        text   = text,
-        voice  = voice,
-        rate   = rate,
-        volume = volume,
-        pitch  = pitch,
-    )
-    mp3_buf = io.BytesIO()
-    async for chunk in communicate.stream():
-        if chunk["type"] == "audio":
-            mp3_buf.write(chunk["data"])
-    mp3_buf.seek(0)
-    return mp3_buf.read()
+def _play_audio_pcm16le(audio_bytes: bytes, samplerate: int = DEFAULT_SAMPLE_RATE) -> None:
+    """Phát raw PCM signed 16-bit little-endian."""
+    audio_i16 = np.frombuffer(audio_bytes, dtype=np.int16)
+    if audio_i16.size == 0:
+        return
 
-
-def _play_audio(audio_bytes: bytes) -> None:
-    """Decode MP3 bytes rồi phát qua sounddevice."""
-    buf = io.BytesIO(audio_bytes)
-    data, samplerate = sf.read(buf, dtype="float32")
-    sd.play(data, samplerate)
+    audio_f32 = (audio_i16.astype(np.float32) / 32768.0).clip(-1.0, 1.0)
+    sd.play(audio_f32, samplerate)
     sd.wait()
+
+
+# ===================== SYNTH =====================
+
+def _synthesize_gemini(
+    text: str,
+    voice_name: str,
+    model_id: str,
+    api_key: str,
+) -> bytes:
+    """
+    Gọi Google AI Studio (Gemini API) để tạo giọng nói.
+    """
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent?key={api_key}"
+
+    headers = {
+        "Content-Type": "application/json",
+    }
+
+    payload = {
+        "contents": [
+            {
+                "role": "user",
+                # Rất quan trọng: Phải yêu cầu model CHỈ đọc lại text, không trò chuyện thêm
+                "parts": [{"text": f"Read the following text exactly as written, without adding any conversational filler or extra words:\n\n{text}"}]
+            }
+        ],
+        "generationConfig": {
+            "responseModalities": ["AUDIO"],
+            "speechConfig": {
+                "voiceConfig": {
+                    "prebuiltVoiceConfig": {
+                        "voiceName": voice_name
+                    }
+                }
+            }
+        }
+    }
+
+    r = requests.post(url, headers=headers, json=payload, timeout=60)
+    if not r.ok:
+        raise RuntimeError(f"Gemini API error {r.status_code}: {r.text}")
+
+    res_json = r.json()
+    
+    try:
+        # Lấy dữ liệu âm thanh base64 từ JSON response
+        parts = res_json["candidates"][0]["content"]["parts"]
+        for part in parts:
+            if "inlineData" in part:
+                b64_data = part["inlineData"]["data"]
+                # mime_type = part["inlineData"].get("mimeType", "")
+                return base64.b64decode(b64_data)
+        
+        raise ValueError("Không tìm thấy dữ liệu audio trong phản hồi của API.")
+    except (KeyError, IndexError) as e:
+        raise RuntimeError(f"Unexpected response format: {res_json}")
 
 
 # ===================== MAIN CLASS =====================
 
 class TextToSpeech:
     """
-    Text-to-Speech module dùng Microsoft Edge TTS.
+    TTS dùng Google AI Studio (Gemini API).
 
-    Sử dụng:
-        tts = TextToSpeech()
-        tts.speak("Xin chào!")          # non-blocking, xếp hàng
-        tts.speak_wait("Xin chào!")     # blocking, đợi phát xong
-        tts.stop()                       # dừng hẳn
+    ENV cần:
+        GEMINI_API_KEY
+        GEMINI_VOICE_NAME (Optional, mặc định: Puck)
     """
 
     def __init__(
         self,
-        voice:  str = DEFAULT_VOICE,
-        rate:   str = DEFAULT_RATE,
-        volume: str = DEFAULT_VOLUME,
-        pitch:  str = DEFAULT_PITCH,
+        voice_name: str | None = None,
+        model_id: str = DEFAULT_MODEL_ID,
     ):
-        self.voice  = voice
-        self.rate   = rate
-        self.volume = volume
-        self.pitch  = pitch
 
-        self._q:        queue.Queue[str | None] = queue.Queue()
-        self._audio_q:  queue.Queue[bytes | None] = queue.Queue()
+        api_key = os.getenv(GEMINI_API_KEY_ENV)
+        if not api_key:
+            raise ValueError("❌ Không tìm thấy GEMINI_API_KEY")
+
+        v_name = voice_name or os.getenv(GEMINI_VOICE_NAME_ENV) or DEFAULT_VOICE_NAME
+
+        self.api_key = api_key
+        self.voice_name = v_name
+        self.model_id = model_id
+        self.sample_rate = DEFAULT_SAMPLE_RATE
+
+        self._q: queue.Queue[str | None] = queue.Queue()
+        self._audio_q: queue.Queue[bytes | None] = queue.Queue()
+
         self._is_speaking = threading.Event()
-        self._running     = True
+        self._running = True
 
-        self._worker_synth = threading.Thread(target=self._synth_loop, daemon=True, name="TTS-synth")
-        self._worker_play  = threading.Thread(target=self._play_loop, daemon=True, name="TTS-play")
+        self._worker_synth = threading.Thread(
+            target=self._synth_loop,
+            daemon=True,
+            name="TTS-synth"
+        )
+
+        self._worker_play = threading.Thread(
+            target=self._play_loop,
+            daemon=True,
+            name="TTS-play"
+        )
+
         self._worker_synth.start()
         self._worker_play.start()
 
-        console.print(f"[green]✅ TTS sẵn sàng — giọng: [bold]{voice}[/bold][/green]")
+        console.print(
+            f"[green]✅ TTS (Gemini API) ready — voice: [bold]{self.voice_name}[/bold][/green]"
+        )
+
+    # ─────────────────────────────
 
     @staticmethod
     def _clean_text(text: str) -> str:
-        """
-        Loại bỏ dấu ngoặc kép để tránh TTS bị khựng.
-        Giữ nguyên phần còn lại.
-        """
         if not text:
             return ""
-        # Bỏ các dạng ngoặc kép phổ biến: " ” “ ‘ ’
         return re.sub(r'["“”‘’]', "", text)
 
-    # ── public API ────────────────────────────────────────────
+    # ─────────────────────────────
+    # PUBLIC
+    # ─────────────────────────────
 
     def speak(self, text: str) -> None:
-        """Xếp text vào hàng chờ phát (non-blocking)."""
         cleaned = self._clean_text(text)
+
         if cleaned and cleaned.strip():
             self._q.put(cleaned.strip())
 
     def speak_wait(self, text: str) -> None:
-        """Phát ngay và chờ xong (blocking)."""
         cleaned = self._clean_text(text)
-        if not cleaned or not cleaned.strip():
+
+        if not cleaned.strip():
             return
-        audio = asyncio.run(
-            _synthesize(cleaned.strip(), self.voice, self.rate, self.volume, self.pitch)
+
+        audio = _synthesize_gemini(
+            text=cleaned.strip(),
+            voice_name=self.voice_name,
+            model_id=self.model_id,
+            api_key=self.api_key,
         )
-        _play_audio(audio)
+
+        _play_audio_pcm16le(audio, samplerate=self.sample_rate)
 
     def is_speaking(self) -> bool:
-        """True nếu đang phát âm thanh."""
         return self._is_speaking.is_set()
 
     def stop(self) -> None:
-        """Dừng worker thread."""
+
         self._running = False
-        self._q.put(None)          # unblock get()
-        self._audio_q.put(None)    # unblock play get()
+
+        self._q.put(None)
+        self._audio_q.put(None)
+
         self._worker_synth.join(timeout=3)
         self._worker_play.join(timeout=3)
-        console.print("[red]⏹️  TTS đã dừng[/red]")
 
-    # ── internal ──────────────────────────────────────────────
+        console.print("[red]⏹️ TTS stopped[/red]")
 
-    def _synth_loop(self) -> None:
+    # ─────────────────────────────
+    # INTERNAL
+    # ─────────────────────────────
+
+    def _synth_loop(self):
+
         while self._running:
+
             text = self._q.get()
+
             if text is None:
                 self._audio_q.put(None)
                 break
+
             try:
-                audio = asyncio.run(
-                    _synthesize(text, self.voice, self.rate, self.volume, self.pitch)
+
+                audio = _synthesize_gemini(
+                    text=text,
+                    voice_name=self.voice_name,
+                    model_id=self.model_id,
+                    api_key=self.api_key,
                 )
+
                 self._audio_q.put(audio)
+
             except Exception as e:
                 console.print(f"[red]TTS synth error: {e}[/red]")
 
-    def _play_loop(self) -> None:
+    def _play_loop(self):
+
         while self._running:
+
             audio = self._audio_q.get()
+
             if audio is None:
                 break
+
             try:
+
                 self._is_speaking.set()
-                _play_audio(audio)
+
+                _play_audio_pcm16le(audio, samplerate=self.sample_rate)
+
             except Exception as e:
                 console.print(f"[red]TTS play error: {e}[/red]")
+
             finally:
+
                 self._is_speaking.clear()
-
-

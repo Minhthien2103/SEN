@@ -350,7 +350,7 @@ class SpeechToText:
         # 3. TRỘN ÂM THANH (Blend)
         # 0.7 nghĩa là 70% âm thanh đã khử nhiễu + 30% âm thanh gốc
         # Bạn có thể tăng giảm con số này (ví dụ: 0.5, 0.8) để tìm ra mức tốt nhất
-        blend_ratio = 0.8 
+        blend_ratio = 0.85
         mixed_audio = (clean_audio * blend_ratio) + (original_audio * (1.0 - blend_ratio))
 
         # 4. Chuẩn hóa âm lượng (Normalize)
@@ -367,15 +367,23 @@ class SpeechToText:
         Provide previous turns as context to improve Whisper accuracy.
         Keep it short to avoid hurting latency and token limits.
         """
+        base = (
+            "Bạn là hệ thống nhận dạng giọng nói tiếng Việt cho trợ lý ảo SEN.\n"
+            "Hãy phiên âm CHÍNH XÁC những gì người dùng nói bằng tiếng Việt thuần tự nhiên,\n"
+            "bao gồm cả tiếng lóng, từ viết tắt, từ vay mượn tiếng Anh (ví dụ: 'hello', 'ok', 'SEN ơi').\n"
+            "KHÔNG được dịch sang ngôn ngữ khác, KHÔNG được tự ý sửa câu cho văn vẻ hơn,\n"
+            "chỉ cần ghi lại câu nói đúng nhất có thể.\n"
+        )
+
         if not self._prev_transcripts:
-            return "Bạn là SEN, một trợ lý ảo tiếng Việt, trò chuyện hằng ngày tự nhiên."
+            return base
 
         prev = "\n".join(f"- {t}" for t in list(self._prev_transcripts)[-4:])
         return (
-            "Bạn là SEN, một trợ lý ảo tiếng Việt, trò chuyện hằng ngày tự nhiên.\n"
-            "Ngữ cảnh (các câu trước đó của người dùng):\n"
-            f"{prev}\n"
-            "Hãy ưu tiên phiên âm đúng tên riêng/thuật ngữ theo ngữ cảnh."
+            base
+            + "Ngữ cảnh (các câu trước đó của người dùng, chỉ dùng để hiểu rõ hơn):\n"
+            + f"{prev}\n"
+            + "Nếu câu nói mơ hồ (ví dụ: 'uống miếng được không?'), hãy ưu tiên hiểu nối tiếp với chủ đề vừa nói trước đó.\n"
         )
 
     def groq_transcribe(self, audio: np.ndarray) -> str:
