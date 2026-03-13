@@ -8,6 +8,7 @@ import wave
 import tempfile
 import numpy as np
 import re
+from collections import deque
 from typing import Callable
 from dotenv import load_dotenv
 from groq import Groq
@@ -91,10 +92,12 @@ class SpeechToText:
         self,
         config: dict | None = None,
         on_transcript: Callable[[str], None] | None = None,
+        tts=None,
     ):
 
         self.on_transcript = on_transcript
         self.console       = Console()
+        self.tts = tts
 
         api_key = os.getenv("GROQ_API_KEY")
         if not api_key:
@@ -136,6 +139,9 @@ class SpeechToText:
         self.collected_audio = []
         self._seg_counter    = 0
         self._session_tag    = time.strftime("%Y%m%d_%H%M%S")
+
+        # Short rolling context to help Whisper transcribe names/refs
+        self._prev_transcripts = deque(maxlen=6)
 
         self.emotion_model = EmotionPredictor()
         self.tone_model    = AudioToneAnalyzer(debug=True)
@@ -244,7 +250,7 @@ class SpeechToText:
 
         from collections import deque
         # Giữ lại 300ms pre-speech audio để không bị mất âm đầu của từ
-        pre_speech_pad = deque(maxlen=int(0.3 * SR / self.block_size))
+        pre_speech_pad = deque(maxlen=int(0.4 * SR / self.block_size))
 
         self.vad_model.reset_states()
 
@@ -253,6 +259,9 @@ class SpeechToText:
             try:
                 raw = self.audio_q.get(timeout=0.1)
             except queue.Empty:
+                continue
+            
+            if self.tts and self.tts.is_speaking():
                 continue
 
             combined = np.concatenate([carry, raw])
@@ -319,26 +328,55 @@ class SpeechToText:
         Pipeline:
           1. Highpass / lowpass filter
           2. DeepFilterNet denoise
-          3. Peak normalise
+          3. Trộn âm thanh (Mix) để giảm độ gắt của AI
+          4. Peak normalise
         """
         sr = self.config["sample_rate"]
         hp = self.config.get("highpass_hz", 80)
         lp = self.config.get("lowpass_hz", 7500)
 
+        # Lưu lại bản gốc để trộn sau
+        original_audio = audio.copy()
+
+        # 1. Lọc dải tần
         tensor = torch.from_numpy(audio).unsqueeze(0)
         tensor = F.highpass_biquad(tensor, sr, float(hp))
         tensor = F.lowpass_biquad(tensor, sr, float(lp))
-        audio  = tensor.squeeze(0).numpy()
+        filtered_audio = tensor.squeeze(0).numpy()
 
-        audio = self.denoiser.process(audio, sr)
+        # 2. Khử nhiễu qua DeepFilterNet
+        clean_audio = self.denoiser.process(filtered_audio, sr)
 
-        peak = np.max(np.abs(audio))
+        # 3. TRỘN ÂM THANH (Blend)
+        # 0.7 nghĩa là 70% âm thanh đã khử nhiễu + 30% âm thanh gốc
+        # Bạn có thể tăng giảm con số này (ví dụ: 0.5, 0.8) để tìm ra mức tốt nhất
+        blend_ratio = 0.8 
+        mixed_audio = (clean_audio * blend_ratio) + (original_audio * (1.0 - blend_ratio))
+
+        # 4. Chuẩn hóa âm lượng (Normalize)
+        peak = np.max(np.abs(mixed_audio))
         if peak > 0:
-            audio = audio / peak * 0.9
+            mixed_audio = mixed_audio / peak * 0.9
 
-        return audio.astype(np.float32)
+        return mixed_audio.astype(np.float32)
 
     # ================= GROQ STT =================
+
+    def _build_stt_prompt(self) -> str:
+        """
+        Provide previous turns as context to improve Whisper accuracy.
+        Keep it short to avoid hurting latency and token limits.
+        """
+        if not self._prev_transcripts:
+            return "Bạn là SEN, một trợ lý ảo tiếng Việt, trò chuyện hằng ngày tự nhiên."
+
+        prev = "\n".join(f"- {t}" for t in list(self._prev_transcripts)[-4:])
+        return (
+            "Bạn là SEN, một trợ lý ảo tiếng Việt, trò chuyện hằng ngày tự nhiên.\n"
+            "Ngữ cảnh (các câu trước đó của người dùng):\n"
+            f"{prev}\n"
+            "Hãy ưu tiên phiên âm đúng tên riêng/thuật ngữ theo ngữ cảnh."
+        )
 
     def groq_transcribe(self, audio: np.ndarray) -> str:
 
@@ -352,7 +390,7 @@ class SpeechToText:
                     model="whisper-large-v3-turbo",
                     language="vi",
                     temperature=0.0,
-                    prompt="Tiếng Việt, ghi âm rõ ràng."
+                    prompt=self._build_stt_prompt(),
                 )
 
         return transcript.text
@@ -419,6 +457,8 @@ class SpeechToText:
 
             text = text[0].upper() + text[1:]
 
+            self._prev_transcripts.append(text)
+
             console.print(
                 f"\n[bold yellow][VI][/bold yellow] "
                 f"[white]{text}[/white]  "
@@ -430,21 +470,32 @@ class SpeechToText:
                     f.write(f"[VI] {text}\n")
 
             emotion   = self.emotion_model.predict(text)
-            probs_str = ", ".join(
-                f"{label}: {emotion.get(label, 0.0):.3f}"
-                for label in getattr(self.emotion_model, "labels", [])
-            )
+            probs_by_id = emotion.get("probs_by_id")
+            if isinstance(probs_by_id, dict) and all(i in probs_by_id for i in range(7)):
+                id2name = getattr(self.emotion_model, "ID2EMOTION", {})
+                probs_str = ", ".join(
+                    f"{i}.{id2name.get(i, str(i))}: {float(probs_by_id.get(i, 0.0)):.3f}"
+                    for i in range(7)
+                )
+                dominant_out = str(emotion.get("dominant_id", 6))
+            else:
+                # Fallback to old behavior if predictor doesn't provide canonical ids
+                probs_str = ", ".join(
+                    f"{label}: {emotion.get(label, 0.0):.3f}"
+                    for label in getattr(self.emotion_model, "labels", [])
+                )
+                dominant_out = str(emotion.get("dominant", ""))
 
             tone = self.tone_model.analyze(audio, self.config["sample_rate"])
 
             # In kết quả Emotion từ Text
             if probs_str:
                 console.print(
-                    f"[cyan]📝 Text Emotion:[/cyan] {emotion['dominant']} "
+                    f"[cyan]📝 Text Emotion:[/cyan] {dominant_out} "
                     f"[dim]({probs_str})[/dim]"
                 )
             else:
-                console.print(f"[cyan]📝 Text Emotion:[/cyan] {emotion['dominant']}")
+                console.print(f"[cyan]📝 Text Emotion:[/cyan] {dominant_out}")
                 
             # In kết quả Điệu bộ từ Audio Tone
             tone_probs_str = ", ".join(f"{k}: {v:.3f}" for k,v in tone.items() if k not in ["dominant", "human_readable"])

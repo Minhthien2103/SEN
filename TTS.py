@@ -2,6 +2,7 @@ import asyncio
 import io
 import queue
 import threading
+import re
 
 import edge_tts
 import sounddevice as sd
@@ -76,27 +77,43 @@ class TextToSpeech:
         self.pitch  = pitch
 
         self._q:        queue.Queue[str | None] = queue.Queue()
+        self._audio_q:  queue.Queue[bytes | None] = queue.Queue()
         self._is_speaking = threading.Event()
         self._running     = True
 
-        self._worker = threading.Thread(target=self._loop, daemon=True, name="TTS-worker")
-        self._worker.start()
+        self._worker_synth = threading.Thread(target=self._synth_loop, daemon=True, name="TTS-synth")
+        self._worker_play  = threading.Thread(target=self._play_loop, daemon=True, name="TTS-play")
+        self._worker_synth.start()
+        self._worker_play.start()
 
         console.print(f"[green]✅ TTS sẵn sàng — giọng: [bold]{voice}[/bold][/green]")
+
+    @staticmethod
+    def _clean_text(text: str) -> str:
+        """
+        Loại bỏ dấu ngoặc kép để tránh TTS bị khựng.
+        Giữ nguyên phần còn lại.
+        """
+        if not text:
+            return ""
+        # Bỏ các dạng ngoặc kép phổ biến: " ” “ ‘ ’
+        return re.sub(r'["“”‘’]', "", text)
 
     # ── public API ────────────────────────────────────────────
 
     def speak(self, text: str) -> None:
         """Xếp text vào hàng chờ phát (non-blocking)."""
-        if text and text.strip():
-            self._q.put(text.strip())
+        cleaned = self._clean_text(text)
+        if cleaned and cleaned.strip():
+            self._q.put(cleaned.strip())
 
     def speak_wait(self, text: str) -> None:
         """Phát ngay và chờ xong (blocking)."""
-        if not text or not text.strip():
+        cleaned = self._clean_text(text)
+        if not cleaned or not cleaned.strip():
             return
         audio = asyncio.run(
-            _synthesize(text.strip(), self.voice, self.rate, self.volume, self.pitch)
+            _synthesize(cleaned.strip(), self.voice, self.rate, self.volume, self.pitch)
         )
         _play_audio(audio)
 
@@ -108,24 +125,37 @@ class TextToSpeech:
         """Dừng worker thread."""
         self._running = False
         self._q.put(None)          # unblock get()
-        self._worker.join(timeout=3)
+        self._audio_q.put(None)    # unblock play get()
+        self._worker_synth.join(timeout=3)
+        self._worker_play.join(timeout=3)
         console.print("[red]⏹️  TTS đã dừng[/red]")
 
     # ── internal ──────────────────────────────────────────────
 
-    def _loop(self) -> None:
+    def _synth_loop(self) -> None:
         while self._running:
             text = self._q.get()
             if text is None:
+                self._audio_q.put(None)
                 break
             try:
-                self._is_speaking.set()
                 audio = asyncio.run(
                     _synthesize(text, self.voice, self.rate, self.volume, self.pitch)
                 )
+                self._audio_q.put(audio)
+            except Exception as e:
+                console.print(f"[red]TTS synth error: {e}[/red]")
+
+    def _play_loop(self) -> None:
+        while self._running:
+            audio = self._audio_q.get()
+            if audio is None:
+                break
+            try:
+                self._is_speaking.set()
                 _play_audio(audio)
             except Exception as e:
-                console.print(f"[red]TTS error: {e}[/red]")
+                console.print(f"[red]TTS play error: {e}[/red]")
             finally:
                 self._is_speaking.clear()
 
