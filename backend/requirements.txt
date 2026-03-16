@@ -1,0 +1,40 @@
+# --- CẤU HÌNH PYTORCH INDEX (Thống nhất dùng CUDA 12.4) ---
+--extra-index-url https://download.pytorch.org/whl/cu124
+
+# --- SERVER & GIAO TIẾP (Bổ sung thêm) ---
+fastapi>=0.110.0
+uvicorn>=0.29.0
+python-socketio>=5.11.0
+
+# --- LÕI TÍNH TOÁN & XỬ LÝ ẢNH ---
+numpy==1.26.4
+opencv-python==4.9.0.80
+pillow>=10.2.0
+
+# --- LÕI AI & DEEP LEARNING (Đã gộp chung PyTorch cu124) ---
+torch==2.6.0+cu124
+torchaudio==2.6.0+cu124
+torchvision==0.21.0+cu124
+transformers==5.3.0
+accelerate==1.13.0
+evaluate==0.4.6
+datasets==4.7.0
+
+# --- AI NHẬN DIỆN KHUÔN MẶT & CẢM XÚC ---
+mediapipe==0.10.11
+hsemotion==0.2.0
+
+# --- TÍCH HỢP API VLM (Google, Groq) ---
+google-generativeai>=0.4.0
+groq==1.1.1
+python-dotenv==1.2.2
+
+# --- XỬ LÝ ÂM THANH (STT & TTS) ---
+soundfile==0.13.1
+sounddevice==0.5.5
+edge-tts==7.2.7
+webrtcvad-wheels==2.0.14
+DeepFilterNet==0.5.6
+
+# --- GIAO DIỆN TERMINAL ---
+rich==14.3.3
