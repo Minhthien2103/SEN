@@ -1,0 +1,18 @@
+Requirement VISION 
+--extra-index-url https://download.pytorch.org/whl/cu118
+
+# 1. Các thư viện tính toán và xử lý ảnh (Tương ứng với import numpy, cv2)
+numpy==1.26.4
+opencv-python==4.9.0.80
+
+# 2. Lõi AI hỗ trợ Card đồ họa (Bắt buộc cho HSEmotion)
+torch==2.2.1+cu118
+torchvision==0.17.1+cu118
+torchaudio==2.2.1+cu118
+
+# 3. AI Nhận diện Khuôn mặt (Tương ứng với import mediapipe)
+mediapipe==0.10.11
+
+# 4. AI Phân tích Cảm xúc (Tương ứng với import hsemotion)
+hsemotion==0.2.0
+
