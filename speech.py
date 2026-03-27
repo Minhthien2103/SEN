@@ -29,6 +29,7 @@ import time
 import wave
 from collections import deque
 from typing import Callable
+from pydub import AudioSegment
 
 import numpy as np
 import soundfile as sf
@@ -41,6 +42,10 @@ from groq import Groq
 from brain import EmotionPredictor
 from core.Env_classifier import EnvironmentClassifier
 from core.SER import AudioToneAnalyzer
+
+# Rhubard
+import json
+import subprocess
 
 load_dotenv()
 
@@ -70,6 +75,49 @@ def _resample_np(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
     t = torch.from_numpy(audio).unsqueeze(0)
     t = F.resample(t, orig_sr, target_sr)
     return t.squeeze(0).numpy()
+
+
+# ── DeepFilterNet Wrapper ─────────────────────────────────────────────────────
+def generate_mouth_cues(audio_bytes, rhubarb_path="./rhubarb.exe"):
+    # Tạo tên file tạm thời không bị trùng lặp
+    timestamp = int(time.time() * 1000)
+    temp_wav = f"temp_rhubarb_{timestamp}.wav"
+    temp_json = f"temp_rhubarb_{timestamp}.json"
+    
+    mouth_cues = []
+    
+    try:
+        # 1. Ghi byte âm thanh ra file vật lý để Rhubarb có thể đọc
+        with open(temp_wav, "wb") as f:
+            f.write(audio_bytes)
+            
+        # 2. Gọi Rhubarb
+        command = [
+            rhubarb_path,
+            "-f", "json",
+            "--machineReadable",
+            "-o", temp_json,
+            temp_wav
+        ]
+        
+        # Chạy ẩn không in log rác ra màn hình (stdout=subprocess.DEVNULL)
+        subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        
+        # 3. Đọc kết quả
+        with open(temp_json, 'r', encoding='utf-8') as f:
+            rhubarb_data = json.load(f)
+            
+        # Lưu ý: Trả về key "mouthCues" viết hoa chữ C để khớp 100% với C# Unity
+        mouth_cues = rhubarb_data.get("mouthCues", [])
+        
+    except Exception as e:
+        print(f"❌ [Rhubarb Error]: Lỗi tạo khẩu hình miệng: {e}")
+    finally:
+        # 4. Luôn luôn dọn dẹp rác dù thành công hay thất bại
+        if os.path.exists(temp_wav): os.remove(temp_wav)
+        if os.path.exists(temp_json): os.remove(temp_json)
+        
+    return mouth_cues
 
 
 # ── DeepFilterNet Wrapper ─────────────────────────────────────────────────────
@@ -110,7 +158,7 @@ class SpeechToText:
         self.tts           = tts
 
         api_key = os.getenv("GROQ_API_KEY")
-        if not api_key:
+        if not api_key: 
             raise ValueError("❌ Không tìm thấy GROQ_API_KEY trong file .env")
         self.groq_client = Groq(api_key=api_key)
 
@@ -164,6 +212,24 @@ class SpeechToText:
             r"|Xin chào các bạn|Chúc các bạn|Tạm biệt)",
             r"^\.{2,}$",
             r"^-{2,}$",
+            r"ghiền mì gô", 
+            r"đăng ký kênh", 
+            r"nhớ đăng ký", 
+            r"subscribe", 
+            r"bấm sub",
+            r"follow", 
+            r"theo dõi", 
+            r"cảm ơn các bạn", 
+            r"hẹn gặp lại", 
+            r"chào mừng các bạn",
+            r"ấn chuông", 
+            r"like và share", 
+            r"ủng hộ mình",
+            r"xem tiếp phần", 
+            r"tập \d+",
+            r"bản tin",
+            r"thời sự",
+            r"chúc các bạn"
         ]
 
     # ── Mic Gate ──────────────────────────────────────────────────────────────
@@ -578,8 +644,25 @@ async def _synthesize(text: str, voice: str, rate: str, volume: str, pitch: str)
     async for chunk in communicate.stream():
         if chunk["type"] == "audio":
             mp3_buf.write(chunk["data"])
+            
     mp3_buf.seek(0)
-    return mp3_buf.read()
+    
+    # --- BẢN VÁ: DỊCH MP3 SANG CHUẨN WAV (PCM 16-bit) ---
+    try:
+        # Đọc MP3 từ RAM
+        audio = AudioSegment.from_mp3(mp3_buf)
+        
+        # Ép chuẩn WAV 16-bit (Để Rhubarb và C# đọc mượt 100%)
+        audio = audio.set_sample_width(2) 
+        
+        # Lưu ngược lại thành WAV trên RAM
+        wav_buf = io.BytesIO()
+        audio.export(wav_buf, format="wav")
+        
+        return wav_buf.getvalue()
+    except Exception as e:
+        print(f"❌ [LỖI TTS] Không thể dịch MP3 sang WAV: {e}")
+        return mp3_buf.read() # Fallback trả về cục cũ nếu lỗi
 
 
 def _play_audio(audio_bytes: bytes) -> None:

@@ -16,3 +16,4 @@ mediapipe==0.10.11
 # 4. AI Phân tích Cảm xúc (Tương ứng với import hsemotion)
 hsemotion==0.2.0
 
+# Cần import base64, pip install timm==0.9.16
