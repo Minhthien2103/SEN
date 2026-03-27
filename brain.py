@@ -13,6 +13,8 @@ import torch
 from transformers import pipeline
 from dotenv import load_dotenv
 
+from core.fine_tune import EmotionModelTrainer
+
 try:
     from groq import Groq
 except ImportError:
@@ -40,6 +42,12 @@ class EmotionPredictor:
 
     def __init__(self, model_path: str = "vsmec_emotion_model/best"):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        if not os.path.exists(model_path):
+            print(f"Can't find model at'{model_path}' -> Recreating new model by Fine-tuning...")
+            
+            trainer = EmotionModelTrainer()
+            trainer.train_and_save()
 
         print("⏳ Loading PhoBERT emotion model...")
 
@@ -256,9 +264,10 @@ class ResponseGenerator:
             return False
         if len(t.split()) == 1:
             return True
-        return False
+        return False    
 
-    def reply_stream(self, user_text: str):
+
+    def reply_stream(self, user_text: str, hidden_context=""):
         user_text = self._norm_text(user_text)
 
         if not self.guard.is_valid(user_text):
@@ -272,7 +281,19 @@ class ResponseGenerator:
             )
             return
 
-        messages      = self.memory.build_messages(user_text)
+        # --- BẮT ĐẦU PHẦN TÍCH HỢP HIDDEN CONTEXT ---
+        # Trộn báo cáo ẩn vào câu nói của user (Chỉ dùng cho lượt này, không lưu vào lịch sử)
+        enriched_user_text = user_text
+        if hidden_context and hidden_context.strip():
+            enriched_user_text = (
+                f"{user_text}\n\n"
+                f"--- \n"
+                f"[System Note - Chỉ đọc, KHÔNG đọc to lên]: {hidden_context}. "
+                f"Hãy điều chỉnh thái độ phản hồi cho phù hợp với cảm xúc này một cách tự nhiên."
+            )
+        
+        messages = self.memory.build_messages(enriched_user_text)
+
         response_text = ""
 
         for token in self.llm.stream(messages):

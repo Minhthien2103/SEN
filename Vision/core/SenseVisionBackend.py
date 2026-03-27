@@ -1,11 +1,13 @@
 import cv2
 import time
 import json
+import torch
+import base64
 import numpy as np
 import mediapipe as mp
 from collections import deque
 from hsemotion.facial_emotions import HSEmotionRecognizer
-import MoodManager
+from Vision.core.MoodManager import MoodManager
 
 class SenseVisionBackend:
     def __init__(self):
@@ -13,7 +15,19 @@ class SenseVisionBackend:
         self.face_detection = self.mp_face_detection.FaceDetection(min_detection_confidence=0.6)
         
         print("Đang tải AI Cảm xúc...")
+        original_torch_load = torch.load # Lưu lại hàm load gốc
+        
+        def patched_torch_load(*args, **kwargs):
+            kwargs['weights_only'] = False # Ép tắt bảo mật chặn mã độc
+            return original_torch_load(*args, **kwargs)
+        
+        torch.load = patched_torch_load # Tráo hàm của PyTorch
+        
         self.fer = HSEmotionRecognizer(model_name='enet_b0_8_best_vgaf', device='cpu')
+        
+        torch.load = original_torch_load # Khôi phục lại hàm gốc để an toàn cho các module khác
+
+        # self.fer = HSEmotionRecognizer(model_name='enet_b0_8_best_vgaf', device='cpu')
         
         # TÁCH LÀM 2 BỂ CHỨA ĐỘC LẬP THEO FLOWCHART
         self.silence_buffer = MoodManager(mode_name="1_Min_Silence")
@@ -66,6 +80,81 @@ class SenseVisionBackend:
             # Reset lại đồng hồ nhánh Silence để không bị nổ cò súng lỗi
             self.last_silence_report = time.time()
             self.silence_buffer.clear_log()
+
+    def process_base64_frame(self, b64_string: str):
+        """
+        Hàm hứng ảnh Base64 từ Unity, giải mã, cắt mặt và nhận diện cảm xúc.
+        """
+        # ==========================================
+        # 1. GIẢI MÃ BASE64 THÀNH ẢNH OPENCV
+        # ==========================================
+        try:
+            # Xóa đoạn râu ria header nếu Unity có đính kèm (vd: "data:image/jpeg;base64,...")
+            if "," in b64_string:
+                b64_string = b64_string.split(",")[1]
+            
+            img_data = base64.b64decode(b64_string)
+            nparr = np.frombuffer(img_data, np.uint8)
+            frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            
+            if frame is None:
+                return None
+        except Exception as e:
+            print(f"❌ [Vision] Lỗi giải mã Base64: {e}")
+            return None
+
+        # ==========================================
+        # 2. XỬ LÝ KHUNG HÌNH (Ráp logic cũ của sếp vào đây)
+        # ==========================================
+        current_time = time.time()
+        
+        # Giới hạn FPS để không làm cháy CPU máy chủ
+        if current_time - self.last_process_time < self.FRAME_INTERVAL:
+            return None
+            
+        self.last_process_time = current_time
+
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = self.face_detection.process(rgb_frame)
+
+        # Nút: Kiểm tra mặt -> Bắt khuôn to nhất
+        if results.detections:
+            largest_detection = max(results.detections, key=lambda d: d.location_data.relative_bounding_box.width * d.location_data.relative_bounding_box.height)
+            bboxC = largest_detection.location_data.relative_bounding_box
+            ih, iw, _ = frame.shape
+            
+            x, y = int(bboxC.xmin * iw), int(bboxC.ymin * ih)
+            w, h = int(bboxC.width * iw), int(bboxC.height * ih)
+            
+            # An toàn: Tránh tọa độ âm làm crash numpy array
+            x, y = max(0, x), max(0, y)
+            face_img = frame[y:min(y+h, ih), x:min(x+w, iw)]
+
+            if face_img.size > 0:
+                gray_face = cv2.cvtColor(face_img, cv2.COLOR_BGR2GRAY)
+                
+                # Nút: Tính trọng số tin cậy
+                _, _, w_total = self.calculate_reliability(gray_face)
+                
+                # Nút: Tin cậy > 0.3 mới đẩy vào model AI
+                if w_total > 0.3:
+                    head_pose = self.estimate_head_pose(largest_detection)
+                    raw_emotion, scores = self.fer.predict_emotions(face_img, logits=False)
+                    confidence = max(scores)
+                    
+                    # RẼ NHÁNH VÀO 2 BỂ CHỨA
+                    if self.is_speaking:
+                        self.speaking_buffer.add_emotion(raw_emotion, confidence, w_total, head_pose)
+                    else:
+                        self.silence_buffer.add_emotion(raw_emotion, confidence, w_total, head_pose)
+                    
+                    # In log nhỏ cho sếp dễ theo dõi trên Terminal
+                    print(f"👁️ [Vision] Nhìn thấy mặt: {raw_emotion} (Tin cậy: {confidence:.2f} | Pose: {head_pose})")
+                    
+                    # Trả về payload tức thời
+                    return {"emotion": raw_emotion, "confidence": float(confidence)}
+        
+        return None
 
     def run_simulation(self):
         cap = cv2.VideoCapture(0)

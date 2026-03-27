@@ -23,9 +23,11 @@ DeepFilterNet==0.5.6
 rich==14.3.3
 
 
-NOTE: 
+# Thêm pydub với ffmpeg, ngrok
 
-_Để chạy được code thì phải tải có thư mục vsmec_emotion_model gồm thư mục /best (quan trọng) và 5 cái thư mục checkpoint
+# NOTE: 
 
-_Thư mục vsmec_emotion_mode được cài khi tải UIT_VSMEC
+# _Để chạy được code thì phải tải có thư mục vsmec_emotion_model gồm thư mục /best (quan trọng) và 5 cái thư mục checkpoint
+
+# _Thư mục vsmec_emotion_mode được cài khi tải UIT_VSMEC
 
