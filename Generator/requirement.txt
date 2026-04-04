@@ -1,7 +1,0 @@
-# Thư viện chính để giao tiếp với não bộ Google Gemini (VLM)
-google-generativeai>=0.4.0
-
-# Thư viện xử lý hình ảnh siêu nhẹ (Dùng để bung mảng byte từ Unity ra)
-pillow>=10.2.0
-
-python-dotenv==1.2.2

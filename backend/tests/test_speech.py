@@ -1,6 +1,6 @@
 import sys
-from speech import SpeechToText, TextToSpeech
-from brain import ResponseGenerator
+from backend.modules.audio.speech import SpeechToText, TextToSpeech
+from backend.core.brain import ResponseGenerator
 from rich.console import Console
 
 console   = Console()

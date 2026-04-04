@@ -39,9 +39,9 @@ import torchaudio.functional as F
 from dotenv import load_dotenv
 from groq import Groq
 
-from brain import EmotionPredictor
-from core.Env_classifier import EnvironmentClassifier
-from core.SER import AudioToneAnalyzer
+from backend.core.brain import EmotionPredictor
+from backend.modules.audio.Env_classifier import EnvironmentClassifier
+from backend.modules.audio.SER import AudioToneAnalyzer
 
 # Rhubard
 import json

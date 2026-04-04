@@ -11,9 +11,9 @@ from fastapi.middleware.cors import CORSMiddleware
 import soundfile as sf
 
 # Import từ các file "não bộ" và "thanh quản" của hệ thống
-from speech import SpeechToText, _synthesize, generate_mouth_cues
-from brain import ResponseGenerator, EmotionPredictor
-from Vision.core.SenseVisionBackend import SenseVisionBackend
+from backend.modules.audio.speech import SpeechToText, _synthesize, generate_mouth_cues
+from backend.core.brain import ResponseGenerator, EmotionPredictor
+from backend.modules.vision.SenseVisionBackend import SenseVisionBackend
 
 load_dotenv()
 
@@ -218,7 +218,7 @@ async def handle_audio_input(sid, data):
 
         print(f"\n🎤 [Nhận Audio] Chốt câu từ Client ID: {sid}")
         print("   -> 🤖 Bắt đầu chạy dây chuyền AI...")
-        await sio.emit('server_text_reply', {"message": "Server đang suy nghĩ..."}, to=sid)
+        # await sio.emit('server_text_reply', {"message": "Server đang suy nghĩ..."}, to=sid)
         
         message_id = f"msg_{int(time.time())}"
         chunk_idx = 0
@@ -270,10 +270,15 @@ async def handle_audio_input(sid, data):
             print(f"      🧠 Đã đính kèm báo cáo ẩn vào Prompt cho SEN: [{context_str}]")
 
             print("      [2/3] Bắt đầu suy nghĩ, phân tích cảm xúc và stream giọng nói...")
+            
             text_buffer = ""
+            full_sen_text = ""
+
+            await sio.emit('server_user_text', {"text": user_text}, to=sid)
             
             for token in generator.reply_stream(user_text, hidden_context=context_str):
                 text_buffer += token
+                full_sen_text += token
                 await asyncio.sleep(0)
                 
                 if re.search(r'([.,!?:;\n]+)', text_buffer):
@@ -312,6 +317,7 @@ async def handle_audio_input(sid, data):
 
             if text_buffer.strip():
                 chunk_text = text_buffer.strip()
+                full_sen_text += chunk_text
                 print(f"        🗣️ Đang xử lý chunk (cuối): {chunk_text}")
                 
                 emo_res = await asyncio.to_thread(emotion_engine.predict, chunk_text)
@@ -338,6 +344,9 @@ async def handle_audio_input(sid, data):
                     "mouthCues": []
                 }
                 await sio.emit('server_audio_chunk', response_data, to=sid)
+            
+            if full_sen_text.strip():
+                await sio.emit('server_text_reply', {"message": full_sen_text.strip()}, to=sid)
 
             print("      [3/3] Đã stream xong toàn bộ câu trả lời!")
             await sio.emit('server_audio_chunk', {"message_id": message_id, "is_final": True}, to=sid)
@@ -350,6 +359,5 @@ async def handle_audio_input(sid, data):
                 user_memory[sid]["is_busy"] = False
 
 if __name__ == '__main__':
-    # ngrok: ngrok http --domain=brushable-lamont-palaeontographic.ngrok-free.dev 8000
     print("🚀 Server đang mở cửa tại cổng 8000...")
     uvicorn.run(combined_app, host='0.0.0.0', port=8000)

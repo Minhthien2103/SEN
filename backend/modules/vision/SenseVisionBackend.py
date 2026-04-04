@@ -7,7 +7,7 @@ import numpy as np
 import mediapipe as mp
 from collections import deque
 from hsemotion.facial_emotions import HSEmotionRecognizer
-from Vision.core.MoodManager import MoodManager
+from backend.modules.vision.MoodManager import MoodManager
 
 class SenseVisionBackend:
     def __init__(self):

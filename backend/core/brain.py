@@ -13,7 +13,7 @@ import torch
 from transformers import pipeline
 from dotenv import load_dotenv
 
-from core.fine_tune import EmotionModelTrainer
+from backend.training_scripts.fine_tune import EmotionModelTrainer
 
 try:
     from groq import Groq
