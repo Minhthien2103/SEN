@@ -1,22 +1,17 @@
 """
-speech.py — Module tổng hợp toàn bộ chức năng âm thanh của SEN.
-
-  ┌──────────────────────────────────────────────────────────┐
-  │  STT (Speech-To-Text)                                    │
-  │  ├─ DeepFilterDenoiser   — khử nhiễu DeepFilterNet       │
-  │  └─ SpeechToText         — VAD + Groq Whisper            │
-  ├──────────────────────────────────────────────────────────┤
-  │  TTS (Text-To-Speech)                                    │
-  │  └─ TextToSpeech         — Edge-TTS + streaming token    │
-  └──────────────────────────────────────────────────────────┘
+FILE: speech.py
+MÔ TẢ:
+    Module tổng hợp toàn bộ chức năng âm thanh của hệ thống SEN.
+    Quản lý luồng dữ liệu song song (Pipeline) bao gồm:
+    - Nhận diện và khử nhiễu giọng nói (DeepFilterNet + VAD).
+    - Chuyển đổi giọng nói thành văn bản (Groq Whisper STT).
+    - Phân tích cảm xúc âm thanh (SER / HuBERT).
+    - Trích xuất dữ liệu khẩu hình miệng (Rhubarb Lip-sync).
+    - Tổng hợp văn bản thành giọng nói (Edge-TTS).
 """
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# STT — SPEECH TO TEXT
-# ══════════════════════════════════════════════════════════════════════════════
-
 import os
+# Ngăn chặn thư viện HuggingFace in ra các cảnh báo symlink không cần thiết làm trôi log hệ thống
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 
 import asyncio
@@ -39,47 +34,73 @@ import torchaudio.functional as F
 from dotenv import load_dotenv
 from groq import Groq
 
+# Import bộ xử lý não bộ và cấu hình chuẩn đã thống nhất
 from backend.core.brain import EmotionPredictor
+from backend.core.emotion_config import EmotionConfig
 from backend.modules.audio.Env_classifier import EnvironmentClassifier
 from backend.modules.audio.SER import AudioToneAnalyzer
 
-# Rhubard
 import json
 import subprocess
 
 load_dotenv()
 
 try:
+    from rich.console import Console
+    console = Console()
+except ImportError:
+    raise SystemExit("Lỗi: Hãy chạy lệnh 'pip install rich'")
+
+try:
     import sounddevice as sd
 except ImportError:
-    raise SystemExit("❌ pip install sounddevice")
+    console.print("[red]Lỗi: Hãy chạy lệnh 'pip install sounddevice'[/red]")
+    raise SystemExit(1)
 
 try:
     import webrtcvad
 except ImportError:
-    raise SystemExit("❌ pip install webrtcvad-wheels")
-
-try:
-    from rich.console import Console
-    console = Console()
-except ImportError:
-    raise SystemExit("❌ pip install rich")
+    console.print("[red]Lỗi: Hãy chạy lệnh 'pip install webrtcvad-wheels'[/red]")
+    raise SystemExit(1)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-# Thay đổi tốc độ lấy mẫu
-# Vd: chuyển từ 16kHz → 48kHz để phù hợp với yêu cầu của DeepFilterNet
+
 def _resample_np(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
+    """
+    Chuyển đổi tần số lấy mẫu (Sample Rate) của mảng âm thanh.
+
+    Args:
+        audio (np.ndarray): Mảng âm thanh thô.
+        orig_sr (int): Tần số lấy mẫu gốc.
+        target_sr (int): Tần số lấy mẫu mục tiêu.
+
+    Returns:
+        np.ndarray: Mảng âm thanh sau khi chuyển đổi tần số.
+    """
+    # Bỏ qua quá trình tính toán tensor tốn tài nguyên nếu tần số đã khớp
     if orig_sr == target_sr:
         return audio
+    
     t = torch.from_numpy(audio).unsqueeze(0)
     t = F.resample(t, orig_sr, target_sr)
     return t.squeeze(0).numpy()
 
 
-# ── DeepFilterNet Wrapper ─────────────────────────────────────────────────────
-def generate_mouth_cues(audio_bytes, rhubarb_path="./rhubarb.exe"):
-    # Tạo tên file tạm thời không bị trùng lặp
+# ── Khẩu Hình Miệng (Lip-sync) ────────────────────────────────────────────────
+
+def generate_mouth_cues(audio_bytes: bytes, rhubarb_path: str = "./rhubarb.exe") -> list:
+    """
+    Phân tích file âm thanh để tạo dữ liệu đồng bộ khẩu hình miệng (Lip-sync) cho Engine Unity.
+
+    Args:
+        audio_bytes (bytes): Dữ liệu âm thanh thô dạng byte.
+        rhubarb_path (str): Đường dẫn đến file thực thi Rhubarb.
+
+    Returns:
+        list: Danh sách các khung hình miệng (mouthCues) đã được canh thời gian.
+    """
+    # Gắn timestamp vào tên file tạm để tránh xung đột I/O khi hệ thống xử lý nhiều request âm thanh cùng lúc
     timestamp = int(time.time() * 1000)
     temp_wav = f"temp_rhubarb_{timestamp}.wav"
     temp_json = f"temp_rhubarb_{timestamp}.json"
@@ -87,11 +108,10 @@ def generate_mouth_cues(audio_bytes, rhubarb_path="./rhubarb.exe"):
     mouth_cues = []
     
     try:
-        # 1. Ghi byte âm thanh ra file vật lý để Rhubarb có thể đọc
+        # Rhubarb engine bắt buộc đọc luồng âm thanh từ file vật lý thay vì buffer trên RAM
         with open(temp_wav, "wb") as f:
             f.write(audio_bytes)
             
-        # 2. Gọi Rhubarb
         command = [
             rhubarb_path,
             "-f", "json",
@@ -100,52 +120,78 @@ def generate_mouth_cues(audio_bytes, rhubarb_path="./rhubarb.exe"):
             temp_wav
         ]
         
-        # Chạy ẩn không in log rác ra màn hình (stdout=subprocess.DEVNULL)
+        # Chạy quy trình ẩn (DEVNULL) để Rhubarb không đẩy rác log ra màn hình Console chính
         subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         
-        # 3. Đọc kết quả
         with open(temp_json, 'r', encoding='utf-8') as f:
             rhubarb_data = json.load(f)
             
-        # Lưu ý: Trả về key "mouthCues" viết hoa chữ C để khớp 100% với C# Unity
+        # Key "mouthCues" được hardcode theo đúng chuẩn camelCase mà C# Unity Client đang mong đợi
         mouth_cues = rhubarb_data.get("mouthCues", [])
         
     except Exception as e:
-        print(f"❌ [Rhubarb Error]: Lỗi tạo khẩu hình miệng: {e}")
+        console.print(f"[red]Lỗi tạo khẩu hình miệng (Rhubarb): {e}[/red]")
     finally:
-        # 4. Luôn luôn dọn dẹp rác dù thành công hay thất bại
+        # Giải phóng ổ cứng ngay lập tức để tránh tràn đĩa khi Server chạy thời gian dài
         if os.path.exists(temp_wav): os.remove(temp_wav)
         if os.path.exists(temp_json): os.remove(temp_json)
         
     return mouth_cues
 
 
-# ── DeepFilterNet Wrapper ─────────────────────────────────────────────────────
-# Lọc Nhiễu
-class DeepFilterDenoiser:
+# ── Bộ Lọc Nhiễu ──────────────────────────────────────────────────────────────
 
+class DeepFilterDenoiser:
+    """
+    Bộ lọc nhiễu âm thanh sử dụng mạng nơ-ron học sâu (DeepFilterNet).
+    Tối ưu để hoạt động thời gian thực với độ trễ thấp, tăng cường độ rõ 
+    của giọng nói trước khi đưa vào module STT.
+    """
+    
     DF_SR = 48_000
 
     def __init__(self):
         try:
             from df.enhance import enhance, init_df
         except ImportError:
-            raise SystemExit("❌ pip install deepfilternet")
+            console.print("[red]Lỗi: Hãy chạy lệnh 'pip install deepfilternet'[/red]")
+            raise SystemExit(1)
 
         self._enhance = enhance
         self._model, self._df_state, _ = init_df()
 
     def process(self, audio_f32: np.ndarray, sr: int) -> np.ndarray:
+        """
+        Khử tiếng ồn nền cho đoạn âm thanh đầu vào.
+
+        Args:
+            audio_f32 (np.ndarray): Mảng âm thanh dạng float32.
+            sr (int): Tần số lấy mẫu gốc của âm thanh.
+
+        Returns:
+            np.ndarray: Mảng âm thanh đã được làm sạch tiếng ồn.
+        """
+        # DeepFilterNet bắt buộc nhận đầu vào 48kHz để có thể phân tích toàn bộ phổ âm thanh
         audio_48k = _resample_np(audio_f32, sr, self.DF_SR)
         tensor    = torch.from_numpy(audio_48k).unsqueeze(0)
+        
         enhanced  = self._enhance(self._model, self._df_state, tensor)
+        
         audio_48k = enhanced.squeeze(0).numpy()
+        # Ép tần số lấy mẫu về lại chuẩn ban đầu để không làm gián đoạn luồng của module STT
         return _resample_np(audio_48k, self.DF_SR, sr)
 
 
-# ── SpeechToText ──────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# STT — SPEECH TO TEXT & AUDIO PIPELINE
+# ══════════════════════════════════════════════════════════════════════════════
 
 class SpeechToText:
+    """
+    Module quản lý toàn bộ vòng đời của việc nhận diện giọng nói:
+    Lấy dữ liệu từ Mic -> Khử ồn -> Kiểm tra giọng nói (VAD) -> 
+    Dịch thành văn bản (Groq) -> Phân tích cảm xúc -> Đẩy cho LLM.
+    """
 
     def __init__(
         self,
@@ -153,22 +199,41 @@ class SpeechToText:
         on_transcript: Callable[[str], None] | None = None,
         tts=None,
     ):
+        """
+        Khởi tạo hệ thống STT và các model phụ trợ.
+
+        Args:
+            config (dict): Từ điển chứa các cấu hình cho hệ thống âm thanh (như sample rate, ngưỡng VAD...).
+            on_transcript (Callable): Callback được gọi khi có văn bản mới được dịch ra.
+            tts (Object): Tham chiếu đến đối tượng TextToSpeech để chặn ghi âm khi bot đang nói (chống tiếng vọng).
+        """
         self.on_transcript = on_transcript
         self.console       = Console()
         self.tts           = tts
 
         api_key = os.getenv("GROQ_API_KEY")
         if not api_key: 
-            raise ValueError("❌ Không tìm thấy GROQ_API_KEY trong file .env")
+            raise ValueError("Không tìm thấy GROQ_API_KEY trong file .env")
         self.groq_client = Groq(api_key=api_key)
 
         self.config = config or {
-            "sample_rate":        16_000, # tốc độ lấy mẫu -> mỗi giây thực hiện 16,000 phép đo để ghi lại cường độ của âm thanh
+            # Tần số lấy mẫu 16kHz là mức tiêu chuẩn tối ưu cho các mô hình AI âm thanh hiện tại (VAD, Whisper, HuBERT).
+            "sample_rate":        16_000, 
             "language":           "vi",
-            "vad_threshold":      0.50, # độ nhạy của silero VAD, tăng độ khắt khe cho bộ lọc. Giá trị càng cao thì càng ít âm thanh được coi là "speech"
-            "min_silence_ms":     650, # Khoảng lặng để máy hiểu bạn đã kết thúc câu
-            "min_speech_ms":      250,# Một tiếng động phải kéo dài ít nhất 250ms thì mới được coi là lời nói.
-            "early_transcribe_s": 8.0, # nói liên tục quá 8 giây mà không nghỉ, máy sẽ tự động cắt đoạn đó ra để xử lý trước
+            
+            # Ngưỡng VAD: Quyết định độ nhạy của việc cắt câu. Càng cao càng ít bị cắt nhầm bởi tiếng ồn, 
+            # nhưng nếu cao quá có thể bỏ sót tiếng thì thầm. Sẽ được module Env_classifier tự động điều chỉnh.
+            "vad_threshold":      0.50, 
+            
+            # Thời gian yên lặng tối thiểu để hệ thống hiểu là người dùng đã ngắt câu và bắt đầu dịch.
+            "min_silence_ms":     650, 
+            
+            # Loại bỏ các tiếng tặc lưỡi, ho hay tiếng ồn ngắn (dưới 250ms) không phải là lời nói có ý nghĩa.
+            "min_speech_ms":      250,
+            
+            # Nếu người dùng nói một tràng quá dài (hơn 8 giây), cắt ngang để dịch trước giúp hệ thống phản hồi mượt hơn.
+            "early_transcribe_s": 8.0, 
+            
             "webrtc_vad_mode":    2,
             "highpass_hz":        80,
             "lowpass_hz":         7_500,
@@ -202,7 +267,8 @@ class SpeechToText:
         self._pending_env_log = []
         self._env_log_lock    = threading.Lock()
 
-        # bộ lọc chặn để ngăn SEN không hiển thị những câu rác này
+        # Bộ lọc Regular Expression dùng để loại bỏ hiện tượng "ảo giác" (hallucination) cực kỳ phổ biến 
+        # của model Whisper khi nó cố gắng chèn các câu kết thúc YouTube ngẫu nhiên vào đoạn âm thanh nhiễu.
         self.hallucination_patterns = [
             r"^\s*$",
             r"^\W+$",
@@ -235,9 +301,11 @@ class SpeechToText:
     # ── Mic Gate ──────────────────────────────────────────────────────────────
 
     def mute_mic(self) -> None:
+        """Kích hoạt cờ khóa luồng dữ liệu từ microphone."""
         self._mic_muted.set()
 
     def unmute_mic(self) -> None:
+        """Xóa sạch hàng đợi âm thanh cũ để tránh dịch nhầm tiếng vọng, sau đó mở khóa mic."""
         while not self.audio_q.empty():
             try:
                 self.audio_q.get_nowait()
@@ -248,29 +316,34 @@ class SpeechToText:
     # ── Model Load ────────────────────────────────────────────────────────────
 
     def load_models(self) -> None:
-        console.print("[cyan]⏳ Khởi tạo WebRTC VAD...[/cyan]")
+        self.console.print("[cyan]Khởi tạo WebRTC VAD...[/cyan]")
         self.webrtc_vad = webrtcvad.Vad(self.config["webrtc_vad_mode"])
-        console.print("[green]✅ WebRTC VAD OK[/green]")
+        self.console.print("[green]WebRTC VAD OK[/green]")
 
-        console.print("[cyan]⏳ Tải Silero VAD...[/cyan]")
+        self.console.print("[cyan]Tải Silero VAD...[/cyan]")
         self.vad_model = self._load_silero_vad_local()
         self.vad_model.eval()
-        console.print("[green]✅ Silero VAD OK[/green]")
+        self.console.print("[green]Silero VAD OK[/green]")
 
-        console.print("[cyan]⏳ Tải DeepFilterNet...[/cyan]")
+        self.console.print("[cyan]Tải DeepFilterNet...[/cyan]")
         self.denoiser = DeepFilterDenoiser()
-        console.print("[green]✅ DeepFilterNet OK[/green]")
+        self.console.print("[green]DeepFilterNet OK[/green]")
 
         self.env_classifier.start()
 
     # ── Silero Cache ──────────────────────────────────────────────────────────
-    # Tải mô hình Silero VAD và lưu nó vào ổ cứng máy tính để dùng lại thay vì phải tải từ trên mạng mỗi khi bạn mở chương trình.
+    
     def _load_silero_vad_local(self):
+        """
+        Lưu cache mô hình Silero VAD vào ổ đĩa nội bộ (JIT Compiled).
+        Mục đích: Tăng tốc độ khởi động ở các lần chạy sau và cho phép hệ thống
+        vẫn hoạt động kể cả khi mất kết nối mạng.
+        """
         hub_dir    = torch.hub.get_dir()
         model_path = os.path.join(hub_dir, "silero_vad_cached.jit")
 
         if not os.path.exists(model_path):
-            console.print("[yellow]📥 Caching Silero VAD...[/yellow]")
+            self.console.print("[yellow]Caching Silero VAD...[/yellow]")
             model, _ = torch.hub.load(
                 "snakers4/silero-vad",
                 "silero_vad",
@@ -283,11 +356,15 @@ class SpeechToText:
         return torch.jit.load(model_path, map_location="cpu")
 
     # ── Audio Callback ────────────────────────────────────────────────────────
-    # lấy âm thanh trực tiếp từ microphone của bạn và phân phối đến các bộ phận xử lý khác nhau
+    
     def audio_callback(self, indata, frames, time_info, status) -> None:
+        """
+        Hàm callback bất đồng bộ của thư viện sounddevice.
+        Trực tiếp nhận từng gói dữ liệu nhỏ từ phần cứng Microphone.
+        """
         block = indata[:, 0].copy().astype(np.float32)
 
-        # Nếu không tắt mic (not _mic_muted) và có bộ phân loại môi trường, nó sẽ đẩy đoạn âm thanh này vào bộ Environment Classifier 
+        # Chuyển tiếp âm thanh sang luồng phân tích môi trường để auto-tune ngưỡng VAD.
         if not self._mic_muted.is_set() and hasattr(self, "env_classifier"):
             self.env_classifier.push_audio(block)
 
@@ -296,9 +373,14 @@ class SpeechToText:
 
         self.audio_q.put(block)
 
-    # ── VAD ───────────────────────────────────────────────────────────────────
-    # bộ lọc giọng nói sơ cấp: check xem có phải người đang nói hay không
+    # ── VAD Logic ─────────────────────────────────────────────────────────────
+    
     def _webrtc_is_speech(self, samples_f32: np.ndarray) -> bool:
+        """
+        Sử dụng thuật toán kinh điển WebRTC VAD (cực nhẹ và nhanh) để lọc bước 1.
+        Nếu WebRTC kết luận không có tiếng người, hệ thống sẽ bỏ qua đoạn âm thanh này
+        để không tốn tài nguyên chạy mô hình AI Silero VAD nặng hơn.
+        """
         pcm_int16 = (samples_f32 * 32767).clip(-32768, 32767).astype(np.int16)
         sr        = self.config["sample_rate"]
 
@@ -312,14 +394,18 @@ class SpeechToText:
         except Exception:
             return True
             
-    # tính toán xem đoạn âm thanh đó có bao nhiêu phần trăm là tiếng người nói
-    # Là check 2 lớp: Nếu WebRTC nghi ngờ có tiếng người, hàm gọi _vad_prob để dùng AI tính xác suất thực tế.
     def _vad_prob(self, block: np.ndarray) -> float:
+        """Lọc bước 2: Dùng mạng nơ-ron Silero VAD để tính xác suất thực sự là tiếng người."""
         t = torch.FloatTensor(block)
         with torch.no_grad():
             return self.vad_model(t, 16000).item()
 
     def vad_thread(self) -> None:
+        """
+        Luồng nền liên tục giám sát và cắt các khối âm thanh.
+        Nó quyết định khi nào người dùng bắt đầu nói, và khi nào họ đã nói xong
+        để đóng gói lại thành một đoạn ghi âm hoàn chỉnh gửi đi dịch.
+        """
         SR                = self.config["sample_rate"]
         min_sil_chunks    = int(self.config["min_silence_ms"] / 1000 * SR / self.block_size)
         early_chunks      = int(self.config["early_transcribe_s"] * SR / self.block_size)
@@ -330,6 +416,10 @@ class SpeechToText:
         speech_blocks_count = 0
         in_speech           = False
         carry               = np.array([], dtype=np.float32)
+        
+        # Buffer đệm: Lưu trữ 0.4 giây âm thanh ngay trước khi VAD phát hiện ra tiếng người.
+        # Lý do: Con người thường nói âm tiết đầu tiên khá nhỏ hoặc bị nhiễu, nếu không có đệm này
+        # chữ cái đầu tiên của câu sẽ luôn luôn bị cắt mất.
         pre_speech_pad      = deque(maxlen=int(0.4 * SR / self.block_size))
 
         self.vad_model.reset_states()
@@ -340,7 +430,7 @@ class SpeechToText:
             except queue.Empty:
                 continue
             
-            # Nếu SEN đang nói, tắt mic
+            # Anti-echo: Tạm dừng lắng nghe khi SEN đang phát giọng nói qua loa.
             if self.tts and self.tts.is_speaking():
                 continue
 
@@ -349,26 +439,24 @@ class SpeechToText:
             carry    = combined[n * self.block_size:]
 
             for i in range(n):
-                # chia thành từng khối để xử lí
                 blk           = combined[i * self.block_size:(i + 1) * self.block_size]
-                webrtc_speech = self._webrtc_is_speech(blk) # check xem có phải tiếng người hay không bằng WebRTC VAD
+                webrtc_speech = self._webrtc_is_speech(blk) 
 
-                # nếu WebRTC không nghĩ đó là tiếng người và hiện tại cũng không đang trong một đoạn nói nào, thì bỏ qua khối này
                 if not webrtc_speech and not in_speech: 
                     pre_speech_pad.append(blk)
                     continue
 
                 prob = self._vad_prob(blk)
-                is_v = prob >= self.config["vad_threshold"] # vượt qua webrtc thì tới vad
+                is_v = prob >= self.config["vad_threshold"]
 
                 if is_v:
                     sil_count = 0
-                    if not in_speech: # nếu đang không nói thì lấy cả phần đệm trước đó để tránh bị cắt lời lúc đầu
+                    if not in_speech: 
                         in_speech           = True
                         speech_buf          = list(pre_speech_pad) + [blk]
                         speech_blocks_count = len(speech_buf)
                     else:
-                        speech_buf.append(blk) # nếu đang nói rồi thì cứ tiếp tục thêm vào buffer
+                        speech_buf.append(blk) 
                         speech_blocks_count += 1
                 else:
                     if not in_speech:
@@ -381,6 +469,7 @@ class SpeechToText:
                         is_early_cut = (len(speech_buf) >= early_chunks and sil_count >= (min_sil_chunks // 3))
                         is_force_cut = len(speech_buf) >= int(early_chunks * 1.5)
 
+                        # Quyết định cắt câu khi: Đạt giới hạn thời gian im lặng, hoặc câu quá dài (early/force cut)
                         if sil_count >= min_sil_chunks or is_early_cut or is_force_cut:
                             if speech_blocks_count >= min_speech_blocks:
                                 self.segment_q.put(np.concatenate(speech_buf))
@@ -395,12 +484,18 @@ class SpeechToText:
     # ── Audio Processing ──────────────────────────────────────────────────────
 
     def clean_audio(self, audio: np.ndarray) -> np.ndarray:
+        """
+        Xử lý làm sạch tín hiệu âm thanh trước khi đưa vào mô hình STT.
+        Sử dụng kết hợp bộ lọc tần số (Biquad Filter) và AI (DeepFilterNet).
+        """
         sr = self.config["sample_rate"]
         hp = self.config.get("highpass_hz", 80)
         lp = self.config.get("lowpass_hz", 7_500)
 
         original = audio.copy()
 
+        # Áp dụng Highpass để loại bỏ tiếng ồn trầm (tiếng quạt máy, tiếng gõ bàn).
+        # Áp dụng Lowpass để loại bỏ tần số siêu âm không cần thiết.
         tensor = torch.from_numpy(audio).unsqueeze(0)
         tensor = F.highpass_biquad(tensor, sr, float(hp))
         tensor = F.lowpass_biquad(tensor, sr, float(lp))
@@ -408,9 +503,13 @@ class SpeechToText:
 
         cleaned = self.denoiser.process(filtered, sr)
 
+        # Trộn (Blend) lại một phần âm thanh gốc. 
+        # Lý do: DeepFilterNet đôi khi lọc quá mạnh làm giọng bị "méo" như robot. 
+        # Giữ lại một chút bản gốc sẽ giúp giọng nói tự nhiên hơn.
         blend_ratio = 0.75
         mixed       = (cleaned * blend_ratio) + (original * (1.0 - blend_ratio))
 
+        # Chuẩn hóa âm lượng (Normalization) để âm thanh không bị rè (clip).
         peak = np.max(np.abs(mixed))
         if peak > 0:
             mixed = mixed / peak * 0.9
@@ -420,6 +519,11 @@ class SpeechToText:
     # ── Groq STT ──────────────────────────────────────────────────────────────
 
     def _build_stt_prompt(self) -> str:
+        """
+        Xây dựng prompt mồi (prompt injection) cho mô hình Whisper.
+        Mục đích: Cung cấp lịch sử hội thoại gần nhất giúp Whisper đoán đúng 
+        ngữ cảnh, từ lóng hoặc tên riêng mà người dùng vừa đề cập.
+        """
         if not self._prev_transcripts:
             return "Bạn là SEN, một trợ lý ảo tiếng Việt, trò chuyện hằng ngày tự nhiên."
 
@@ -432,6 +536,10 @@ class SpeechToText:
         )
 
     def groq_transcribe(self, audio: np.ndarray) -> str:
+        """
+        Gửi đoạn âm thanh lên API Groq để chuyển đổi thành văn bản.
+        Sử dụng tempfile vì SDK của Groq yêu cầu đọc luồng từ một file vật lý.
+        """
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
             self._save_wav(f.name, audio)
             with open(f.name, "rb") as audio_file:
@@ -439,41 +547,49 @@ class SpeechToText:
                     file        = audio_file,
                     model       = "whisper-large-v3-turbo",
                     language    = "vi",
-                    temperature = 0.0,
+                    temperature = 0.0, # Giữ 0.0 để kết quả dịch chính xác nhất, không bịa từ (hallucination)
                     prompt      = self._build_stt_prompt(),
                 )
         return transcript.text
 
     # ── Env Callback ──────────────────────────────────────────────────────────
-    # Detect môi trường
+    
     def _on_env_change(self, preset: str, old: str, label: str) -> None:
+        """Tự động cập nhật các thông số độ nhạy VAD khi môi trường âm thanh thay đổi."""
         for k, v in EnvironmentClassifier.PRESETS[preset].items():
             self.config[k] = v
-        msg = f"[magenta]🌍 Môi trường: {old} → {preset} ({label})[/magenta]"
+        msg = f"[magenta]Môi trường: {old} -> {preset} ({label})[/magenta]"
         with self._env_log_lock:
             self._pending_env_log.append(msg)
 
     def _flush_env_log(self) -> None:
+        """In log môi trường ra màn hình. Dùng lock để tránh đụng độ luồng khi in."""
         with self._env_log_lock:
             logs, self._pending_env_log = self._pending_env_log, []
         for msg in logs:
-            console.print(msg)
+            self.console.print(msg)
 
     # ── Hallucination Filter ──────────────────────────────────────────────────
 
     def _is_hallucination(self, text: str) -> bool:
+        """Quét và chặn các câu văn bản vô nghĩa do lỗi mô hình Whisper sinh ra."""
         return any(re.search(pat, text, re.IGNORECASE) for pat in self.hallucination_patterns)
 
     # ── Transcribe Thread ─────────────────────────────────────────────────────
-    # Làm sạch, Dịch chữ và Phân tích cảm xúc.
+    
     def transcribe_thread(self) -> None:
+        """
+        Luồng trung tâm xử lý khối lượng công việc nặng nhất:
+        Nhận âm thanh -> Làm sạch -> Dịch (STT) -> Phân tích Cảm xúc -> Gọi Callback.
+        """
         while self.is_running:
             try:
                 audio = self.segment_q.get(timeout=0.5)
             except queue.Empty:
                 continue
             
-            # Nếu đoạn âm thanh ngắn hơn 0.4 giây -> bỏ
+            # Lọc bỏ các tiếng click, tiếng thở quá ngắn (dưới 0.4s) 
+            # để không lãng phí API request lên Groq.
             if len(audio) < int(self.config["sample_rate"] * 0.4):
                 continue
 
@@ -484,13 +600,13 @@ class SpeechToText:
                 try:
                     self._save_segment_wav(clean)
                 except Exception as e:
-                    console.print(f"[red]Audio save error: {e}[/red]")
+                    self.console.print(f"[red]Audio save error: {e}[/red]")
 
             start = time.time()
             try:
                 text = self.groq_transcribe(clean)
             except Exception as e:
-                console.print(f"[red]Groq error: {e}[/red]")
+                self.console.print(f"[red]Groq error: {e}[/red]")
                 continue
 
             elapsed = time.time() - start
@@ -500,14 +616,15 @@ class SpeechToText:
 
             text = text.strip()
 
-            # lọc những câu rác
+            # Lọc rác trước khi đưa vào trí nhớ LLM
             if not text or self._is_hallucination(text):
                 continue
 
+            # Chuẩn hóa viết hoa chữ cái đầu
             text = text[0].upper() + text[1:]
             self._prev_transcripts.append(text)
 
-            console.print(
+            self.console.print(
                 f"\n[bold yellow][VI][/bold yellow] "
                 f"[white]{text}[/white]  "
                 f"[dim]({elapsed:.2f}s | {len(audio) / self.config['sample_rate']:.1f}s audio)[/dim]"
@@ -517,7 +634,7 @@ class SpeechToText:
                 with open(self.config["output_file"], "a", encoding="utf-8") as f:
                     f.write(f"[VI] {text}\n")
 
-            # Nhận diện cảm xúc
+            # ── Nhận Diện Cảm Xúc (Văn Bản) ──
             emotion     = self.emotion_model.predict(text)
             probs_by_id = emotion.get("probs_by_id")
 
@@ -533,21 +650,25 @@ class SpeechToText:
                     f"{label}: {emotion.get(label, 0.0):.3f}"
                     for label in getattr(self.emotion_model, "labels", [])
                 )
-                dominant_out = str(emotion.get("dominant", ""))
+                dominant_out = str(emotion.get("dominant", "neutral"))
 
+            # ── Nhận Diện Cảm Xúc (Âm Thanh) ──
             tone = self.tone_model.analyze(audio, self.config["sample_rate"])
 
+            # Chuẩn hóa nhãn tiếng Việt bằng File Config chung
+            dominant_vi = EmotionConfig.VI_MAP.get(dominant_out, dominant_out)
+
             if probs_str:
-                console.print(f"[cyan]📝 Text Emotion:[/cyan] {dominant_out} [dim]({probs_str})[/dim]")
+                self.console.print(f"[cyan]Text Emotion:[/cyan] {dominant_vi} [dim]({probs_str})[/dim]")
             else:
-                console.print(f"[cyan]📝 Text Emotion:[/cyan] {dominant_out}")
+                self.console.print(f"[cyan]Text Emotion:[/cyan] {dominant_vi}")
 
             tone_probs_str = ", ".join(
                 f"{k}: {v:.3f}" for k, v in tone.items()
                 if k not in ("dominant", "human_readable", "confidence")
             )
-            console.print(
-                f"[magenta]🎙️ Audio Tone:[/magenta] {tone['human_readable']} "
+            self.console.print(
+                f"[magenta]Audio Tone:[/magenta] {tone['human_readable']} "
                 f"[dim]({tone_probs_str})[/dim]"
             )
 
@@ -557,20 +678,21 @@ class SpeechToText:
                 try:
                     self.on_transcript(text)
                 except Exception as e:
-                    console.print(f"[red]Reply error: {e}[/red]")
+                    self.console.print(f"[red]Reply error: {e}[/red]")
 
             self._flush_env_log()
 
-    # ── Main ──────────────────────────────────────────────────────────────────
+    # ── Main Loop ─────────────────────────────────────────────────────────────
 
     def run(self) -> None:
+        """Khởi động toàn bộ các thành phần AI và mở kết nối Microphone."""
         self.load_models()
         self.is_running = True
 
         threading.Thread(target=self.vad_thread,        daemon=True).start()
         threading.Thread(target=self.transcribe_thread, daemon=True).start()
 
-        console.print("\n[green]🎙️ Đang lắng nghe...[/green]\n")
+        self.console.print("\n[green]Đang lắng nghe...[/green]\n")
 
         try:
             with sd.InputStream(
@@ -585,14 +707,14 @@ class SpeechToText:
                     time.sleep(0.1)
 
         except KeyboardInterrupt:
-            console.print("\n[red]⏹️ Đã dừng[/red]")
+            self.console.print("\n[red]Đã dừng hệ thống STT[/red]")
             self.is_running = False
             try:
                 self._save_full_session()
             except Exception as e:
-                console.print(f"[red]Full session save error: {e}[/red]")
+                self.console.print(f"[red]Full session save error: {e}[/red]")
 
-    # ── Save WAV ──────────────────────────────────────────────────────────────
+    # ── Save WAV Utils ────────────────────────────────────────────────────────
 
     def _save_wav(self, path: str, audio: np.ndarray) -> None:
         sr  = self.config["sample_rate"]
@@ -619,7 +741,7 @@ class SpeechToText:
         full_path = os.path.join(out_dir, f"{self._session_tag}_full_session.wav")
         combined  = np.concatenate(self.collected_audio)
         self._save_wav(full_path, combined)
-        console.print(f"[bold green]✅ Đã lưu toàn bộ phiên: {full_path}[/bold green]")
+        self.console.print(f"[green]Đã lưu toàn bộ phiên thu âm tại: {full_path}[/green]")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -633,6 +755,12 @@ DEFAULT_PITCH  = "+0Hz"
 
 
 async def _synthesize(text: str, voice: str, rate: str, volume: str, pitch: str) -> bytes:
+    """
+    Gọi API Edge-TTS để chuyển đổi văn bản thành âm thanh (định dạng MP3).
+    Sau đó, bắt buộc phải dịch mã (transcode) từ MP3 sang chuẩn PCM 16-bit WAV.
+    Lý do: Cả engine phân tích khẩu hình miệng (Rhubarb) và Client Unity 
+    đều yêu cầu chuẩn âm thanh không nén (WAV) để xử lý chính xác thời gian thực.
+    """
     communicate = edge_tts.Communicate(
         text   = text,
         voice  = voice,
@@ -647,25 +775,24 @@ async def _synthesize(text: str, voice: str, rate: str, volume: str, pitch: str)
             
     mp3_buf.seek(0)
     
-    # --- BẢN VÁ: DỊCH MP3 SANG CHUẨN WAV (PCM 16-bit) ---
     try:
-        # Đọc MP3 từ RAM
         audio = AudioSegment.from_mp3(mp3_buf)
         
-        # Ép chuẩn WAV 16-bit (Để Rhubarb và C# đọc mượt 100%)
+        # Ép chuẩn WAV 16-bit (Đảm bảo độ phân giải âm thanh tiêu chuẩn, tránh lỗi đọc file từ hệ thống khác)
         audio = audio.set_sample_width(2) 
         
-        # Lưu ngược lại thành WAV trên RAM
         wav_buf = io.BytesIO()
         audio.export(wav_buf, format="wav")
         
         return wav_buf.getvalue()
     except Exception as e:
-        print(f"❌ [LỖI TTS] Không thể dịch MP3 sang WAV: {e}")
-        return mp3_buf.read() # Fallback trả về cục cũ nếu lỗi
+        console.print(f"[red]Lỗi khi dịch mã MP3 sang WAV: {e}[/red]")
+        # Fallback: Trả về luồng MP3 gốc nếu quá trình ép chuẩn thất bại để không làm sập luồng đọc
+        return mp3_buf.read()
 
 
 def _play_audio(audio_bytes: bytes) -> None:
+    """Đẩy trực tiếp luồng byte âm thanh ra loa hệ thống và chặn luồng cho đến khi phát xong."""
     buf  = io.BytesIO(audio_bytes)
     data, samplerate = sf.read(buf, dtype="float32")
     sd.play(data, samplerate)
@@ -675,6 +802,10 @@ def _play_audio(audio_bytes: bytes) -> None:
 # ── TextToSpeech ──────────────────────────────────────────────────────────────
 
 class TextToSpeech:
+    """
+    Quản lý luồng tổng hợp và phát âm thanh đa luồng (Multi-threading).
+    Đảm bảo việc tải âm thanh từ Internet không làm đứng giao diện hoặc luồng nhận diện giọng nói.
+    """
 
     def __init__(
         self,
@@ -700,16 +831,22 @@ class TextToSpeech:
         self._worker_synth.start()
         self._worker_play.start()
 
-        console.print(f"[green]✅ TTS sẵn sàng — giọng: [bold]{voice}[/bold][/green]")
+        console.print(f"[green]TTS sẵn sàng - Giọng: {voice}[/green]")
 
     # ── STT Link ──────────────────────────────────────────────────────────────
 
     def set_stt(self, stt) -> None:
+        """Kết nối module TTS với module STT để đồng bộ trạng thái khóa mic (chống tiếng vọng)."""
         self._stt = stt
 
     # ── Streaming API ─────────────────────────────────────────────────────────
-    # streaming text token by token, mỗi khi có dấu câu hoặc xuống dòng thì sẽ gọi speak() để đọc đoạn đó lên, còn nếu chưa có dấu câu thì cứ tiếp tục lưu vào buffer
+    
     def stream_token(self, token: str) -> None:
+        """
+        Nhận từng token văn bản từ LLM và dồn vào bộ đệm.
+        Mục đích: Tăng tốc độ phản hồi. Thay vì đợi LLM sinh xong toàn bộ câu trả lời,
+        hệ thống sẽ kích hoạt đọc ngay lập tức mỗi khi gặp dấu ngắt câu (chấm, phẩy...).
+        """
         if not token:
             return
         self.text_buffer += token
@@ -721,6 +858,7 @@ class TextToSpeech:
             self.speak(chunk)
 
     def flush_stream(self) -> None:
+        """Xả toàn bộ nội dung còn sót lại trong bộ đệm ra loa khi LLM kết thúc câu trả lời."""
         if self.text_buffer.strip():
             self.speak(self.text_buffer)
         self.text_buffer = ""
@@ -728,12 +866,16 @@ class TextToSpeech:
     # ── Public API ────────────────────────────────────────────────────────────
 
     def speak(self, text: str) -> None:
+        """Đẩy một câu văn bản vào hàng đợi để worker chạy nền tải âm thanh về."""
         cleaned = self._clean_text(text)
         if cleaned and any(c.isalnum() for c in cleaned):
             self._q.put(cleaned.strip())
 
-    # phát âm thanh và bắt chương trình phải đợi cho đến khi nói xong
     def speak_wait(self, text: str) -> None:
+        """
+        Phát âm thanh ở luồng chính (Main Thread) và buộc hệ thống chờ cho đến khi phát xong.
+        Thường dùng cho các câu chào cố định lúc hệ thống vừa khởi động.
+        """
         cleaned = self._clean_text(text)
         if not cleaned or not any(c.isalnum() for c in cleaned):
             return
@@ -743,6 +885,7 @@ class TextToSpeech:
         _play_audio(audio)
 
     def is_speaking(self) -> bool:
+        """Kiểm tra xem hệ thống có đang bận phát âm thanh hay không."""
         return self._is_speaking.is_set()
 
     def stop(self) -> None:
@@ -751,34 +894,44 @@ class TextToSpeech:
         self._audio_q.put(None)
         self._worker_synth.join(timeout=3)
         self._worker_play.join(timeout=3)
-        console.print("[red]⏹️ TTS đã dừng[/red]")
+        console.print("[red]Hệ thống TTS đã dừng[/red]")
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
     @staticmethod
     def _clean_text(text: str) -> str:
+        """Lọc bỏ các ký tự đặc biệt (như dấu ngoặc kép) để tránh API Edge-TTS báo lỗi cú pháp."""
         if not text:
             return ""
         return re.sub(r'["""'']', "", text)
 
     def _synth_loop(self) -> None:
+        """
+        Luồng nền 1 (Worker): Chuyên trách gọi API mạng để tải file âm thanh.
+        Tách biệt với luồng phát để tránh làm giật/lag tiếng khi mạng chậm.
+        """
         while self._running:
             text = self._q.get()
             if text is None:
                 self._audio_q.put(None)
                 break
+            
+            # Khóa mic STT ngay từ khi bắt đầu tổng hợp để chuẩn bị phát loa
             if self._stt:
-                self._stt.mute_mic() # khi SEN đang nói, tắt mic để tránh bị thu lại tiếng của chính nó
+                self._stt.mute_mic() 
+                
             try:
-                # để chuyển chữ thành các đoạn mã âm thanh
                 audio = asyncio.run(
                     _synthesize(text, self.voice, self.rate, self.volume, self.pitch)
                 )
                 self._audio_q.put(audio)
             except Exception as e:
-                console.print(f"[red]TTS synth error: {e}[/red]")
+                console.print(f"[red]Lỗi tổng hợp TTS: {e}[/red]")
 
     def _play_loop(self) -> None:
+        """
+        Luồng nền 2 (Worker): Chuyên trách đẩy byte âm thanh ra phần cứng loa.
+        """
         while self._running:
             audio = self._audio_q.get()
             if audio is None:
@@ -788,8 +941,9 @@ class TextToSpeech:
                 _play_audio(audio)
 
             except Exception as e:
-                console.print(f"[red]TTS play error: {e}[/red]")
+                console.print(f"[red]Lỗi phát TTS: {e}[/red]")
             finally:
                 self._is_speaking.clear()
+                # Chỉ mở khóa mic khi toàn bộ hàng đợi âm thanh đã được phát hết
                 if self._audio_q.empty() and self._stt:
                     self._stt.unmute_mic()
