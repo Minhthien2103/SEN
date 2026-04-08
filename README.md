@@ -1,4 +1,4 @@
-# 🌸 SEN (Synthetic Emotional Neural companion)
+# 🌸 SEN (Solace - Empathy - Nexus)
 > **The Next-Gen Multimodal Virtual Companion**
 
 ![Version](https://img.shields.io/badge/version-1.0.0-blue.svg)
@@ -48,9 +48,14 @@ SEN_Project/
 │
 ├── unity_client/                   # 🎮 Frontend (UI/UX & Character Rendering)
 │   ├── Assets/
-│   │   ├── Scripts/                # C# Scripts (Socket Client, AudioQueue, UI Threading)
-│   │   ├── Plugins/                # Thư viện tích hợp
-│   │   └── Resources/              # Assets nhân vật ảo
+│   │   ├── Audio/                  # Tệp âm thanh hệ thống
+│   │   ├── Live2D/                 # Đồ họa và model nhân vật 2D
+│   │   ├── Scenes/                 # Không gian môi trường ảo
+│   │   ├── Scripts/                # Code C# (Socket, AudioQueue, LipSync, UI,...)
+│   │   ├── Settings/               # Cấu hình Render Pipeline
+│   │   └── TextMesh Pro/           # Hệ thống Font chữ UI
+│   ├── Packages/                   # Quản lý thư viện Unity
+│   └── ProjectSettings/            # Cấu hình môi trường Unity Engine
 │
 └── docs/                           # 📚 Tài liệu Kỹ thuật
     ├── api_spec.md                 # Đặc tả WebSocket & JSON Payload
