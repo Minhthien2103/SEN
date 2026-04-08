@@ -213,3 +213,55 @@ vsmec_emotion_model/
 *.pt
 *.bin
 *.h5
+
+
+# =======================================================
+#  UNITY CLIENT (FRONTEND) IGNORANCE RULES
+# =======================================================
+
+# Bỏ qua các thư mục nặng do Unity tự build/cache
+/[Ll]ibrary/
+/[Tt]emp/
+/[Oo]bj/
+/[Bb]uild/
+/[Bb]uilds/
+/[Ll]ogs/
+/[Uu]ser[Ss]ettings/
+/[Mm]emoryCaptures/
+
+# Bỏ qua các file do Visual Studio / IDE tự sinh ra
+/[Cc]onsole.log
+/[Vv]isual[Ss]tudios[Ee]ttings.txt
+/[Ii]gnore.conf
+*.csproj
+*.unityproj
+*.sln
+*.slnx
+*.suo
+*.tmp
+*.user
+*.userprefs
+*.pidb
+*.booproj
+*.svd
+*.pdb
+*.mdb
+*.opendb
+*.VC.db
+
+# Bỏ qua thư mục build game của sếp (tránh đẩy file EXE lên mạng)
+/file_exe/
+file_exe/
+
+# Bỏ qua thư mục backup rác trong Assets
+/[Aa]ssets/_Recovery/
+
+# Bỏ qua file rác của hệ điều hành
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+Desktop.ini
